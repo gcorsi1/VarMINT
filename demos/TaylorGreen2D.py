@@ -69,9 +69,29 @@ u_IC = as_vector((sin(x[0])*cos(x[1]),-cos(x[0])*sin(x[1])))
 solnT = exp(-2.0*nu*T)
 u_exact = solnT*u_IC
 
+# Expression for boundary condition:
+class solexp(UserExpression):
+    def __init__(self, nu, **kwargs):
+        super().__init__(kwargs)
+        self.t = 0.0
+        self.nu = nu
+    def eval(self, values, x):
+        texp = exp(-2.0*self.nu*self.t)
+        values[0] = sin(x[0])*cos(x[1])*texp
+        values[1] = -cos(x[0])*sin(x[1])*texp
+    def value_shape(self):
+        return (2,)
+solt = solexp(nu, degree=2)
+
 # Weak problem residual; note use of midpoint velocity:
 F = interiorResidual(u_mid,p,v,q,rho,mu,mesh,
                      u_t=u_t,Dt=Dt,C_I=Constant(6.0*(k**4)),dx=dx)
+
+F += weakDirichletBC(u,p,v,q,solt,
+                     rho,mu,mesh,
+                     ds=ds,
+                     sym=True,C_pen=Constant(1e3),
+                     overPenalize=False)
 
 # Project the initial condition:
 up_old.assign(project(as_vector((u_IC[0],u_IC[1],Constant(0.0))),V))
@@ -81,17 +101,30 @@ up.assign(up_old)
 
 # Set no-penetration BCs on velocity and pin down pressure in one corner:
 corner_str = "near(x[0],-pi) && near(x[1],-pi)"
-bcs = [DirichletBC(V.sub(0).sub(0),Constant(0.0),
-                   "near(x[0],-pi) || near(x[0],pi)"),
-       DirichletBC(V.sub(0).sub(1),Constant(0.0),
-                   "near(x[1],-pi) || near(x[1],pi)"),
-       DirichletBC(V.sub(1),Constant(0.0),corner_str,"pointwise")]
+bcs = [DirichletBC(V.sub(1),Constant(0.0),corner_str,"pointwise")]
+# bcs = [DirichletBC(V.sub(0).sub(0),Constant(0.0),
+#                    "near(x[0],-pi) || near(x[0],pi)"),
+#        DirichletBC(V.sub(0).sub(1),Constant(0.0),
+#                    "near(x[1],-pi) || near(x[1],pi)"),
+#        DirichletBC(V.sub(1),Constant(0.0),corner_str,"pointwise")]
 
+t = 0.0
 # Time stepping loop:
 for step in range(0,N_STEPS):
+    t += Dt
     print("======= Time step "+str(step+1)+"/"+str(N_STEPS)+" =======")
+
+    # Update dirichlet boundary condition:
+    solt.t = t
     solve(F==0,up,bcs=bcs)
     up_old.assign(up)
+
+uf, pf = up.split(deepcopy=True)
+uf.rename("Velocity","Velocity")
+pf.rename("Pressure","Pressure")
+with XDMFFile("sol.xdmf") as file:
+    file.write(uf, 0)
+    file.write(pf, 1)
 
 # Check error:
 def L2Norm(u):
