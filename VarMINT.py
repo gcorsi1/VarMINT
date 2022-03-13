@@ -195,7 +195,7 @@ def stableNeumannBC(traction,rho,u,v,n,g=None,ds=ds,gamma=Constant(1.0)):
              + gamma*rho*ufl.Min(inner(u,n),Constant(0.0))
              *inner(u_minus_g,v))*ds
 
-def weakDirichletBC(u,p,v,q,g,rho,mu,mesh,ds=ds,G=None,
+def weakDirichletBC(u,p,v,q,g,rho,mu,mesh,ds=ds,n_analytic=None,G=None,
                     sym=True,C_pen=Constant(1e3),
                     overPenalize=False):
     """
@@ -220,6 +220,8 @@ def weakDirichletBC(u,p,v,q,g,rho,mu,mesh,ds=ds,G=None,
     https://doi.org/10.1016/j.compfluid.2005.07.012
     """
     n = FacetNormal(mesh)
+    if n_analytic is not None:
+        n = n_analytic 
     sgn = 1.0
     if(not sym):
         sgn = -1.0
