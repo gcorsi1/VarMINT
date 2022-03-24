@@ -73,7 +73,8 @@ nu = mu/rho
 
 # Initial condition for the Taylor--Green vortex
 x = SpatialCoordinate(mesh)
-u_IC = as_vector((sin(x[0])*cos(x[1]),-cos(x[0])*sin(x[1])))
+# u_IC = as_vector((sin(x[0])*cos(x[1]),-cos(x[0])*sin(x[1])))
+u_IC = as_vector((Constant(0.0),Constant(0.0)))
 
 # Time dependence of exact solution, evaluated at time T:
 solnT = exp(-2.0*nu*T)
@@ -120,21 +121,21 @@ bcs = [DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, 1),
 
 t = 0.0
 # Time stepping loop:
-for step in range(0,N_STEPS):
-    t += Dt
-    print("======= Time step "+str(step+1)+"/"+str(N_STEPS)+" =======")
+with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
+    for step in range(0,N_STEPS):
+        t += Dt
+        print("======= Time step "+str(step+1)+"/"+str(N_STEPS)+" =======")
 
-    # Update dirichlet boundary condition:
-    solt.t = t
-    solve(F==0,up,bcs=bcs)
-    up_old.assign(up)
+        # Update dirichlet boundary condition:
+        solt.t = t
+        solve(F==0,up,bcs=bcs)
+        up_old.assign(up)
 
-uf, pf = up.split(deepcopy=True)
-uf.rename("Velocity","Velocity")
-pf.rename("Pressure","Pressure")
-with XDMFFile("sol.xdmf") as file:
-    file.write(uf, 0)
-    file.write(pf, 1)
+        uf, pf = up.split(deepcopy=True)
+        uf.rename("Velocity","Velocity")
+        pf.rename("Pressure","Pressure")
+        fileu.write(uf, step)
+        filep.write(pf, step)
 
 # Check error:
 def L2Norm(u):

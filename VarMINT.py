@@ -168,7 +168,7 @@ def interiorResidual(u,p,v,q,rho,mu,mesh,G=None,
             - inner(grad(v),outer(uPrime,uPrime))/rho)*dx
 
     if u_mesh != None:
-        ires +=  inner(dot(u_mesh,nabla_grad(v)) + grad(q)/rho, uPrime)
+        ires +=  inner(dot(u_mesh,nabla_grad(v)), uPrime)*dx
 
     return ires
 
