@@ -37,7 +37,7 @@ def meshMetric(mesh):
     G = dxiHat_dx.T*dxiHat_dx
     return G
 
-def stabilizationParameters(u,nu,G,C_I,C_t,Dt=None,scale=Constant(1.0)):
+def stabilizationParameters(u,nu,G,C_I,C_t,Dt=None,scale=Constant(1.0),u_mesh=None):
     """
     Compute SUPS and LSIC/grad-div stabilization parameters (returned as a 
     tuple, in that order).  Input parameters are the velocity ``u``, the
@@ -47,7 +47,10 @@ def stabilizationParameters(u,nu,G,C_I,C_t,Dt=None,scale=Constant(1.0)):
     """
     # The additional epsilon is needed for zero-velocity robustness
     # in the inviscid limit.
-    denom2 = inner(u,G*u) + C_I*nu*nu*inner(G,G) + DOLFIN_EPS
+    # If u_mesh is given, use relative velocity 
+    ur = u if u_mesh is None else (u - u_mesh)
+
+    denom2 = inner(ur,G*ur) + C_I*nu*nu*inner(G,G) + DOLFIN_EPS
     if(Dt != None):
         denom2 += C_t/Dt**2
     tau_M = scale/sqrt(denom2)
@@ -76,27 +79,29 @@ def resolvedDissipationForm(u,v,mu,dx=dx):
     """
     return inner(sigmaVisc(u,mu),grad(v))*dx
 
-def materialTimeDerivative(u,u_t=None,f=None):
+def materialTimeDerivative(u,u_t=None,f=None, u_mesh=None):
     """
     The fluid material time derivative, in terms of the velocity ``u``, 
     the partial time derivative ``u_t`` (which may be omitted for steady
     problems), and body force per unit mass, ``f``.
     """
     DuDt = dot(u,nabla_grad(u))
+    if u_mesh != None:
+        DuDt -= dot(u_mesh,nabla_grad(u))
     if(u_t != None):
         DuDt += u_t
     if(f != None):
         DuDt -= f
     return DuDt
 
-def strongResidual(u,p,mu,rho,u_t=None,f=None):
+def strongResidual(u,p,mu,rho,u_t=None,f=None,u_mesh=None):
     """
     The momenum and continuity residuals, as a tuple, of the strong PDE,
     system, in terms of velocity ``u``, pressure ``p``, dynamic viscosity
     ``mu``, mass density ``rho``, and, optionally, the partial time derivative
     of velocity, ``u_t``, and a body force per unit mass, ``f``.  
     """
-    DuDt = materialTimeDerivative(u,u_t,f)
+    DuDt = materialTimeDerivative(u,u_t,f,u_mesh)
     i,j = ufl.indices(2)
     r_M = rho*DuDt - as_tensor(grad(sigma(u,p,mu))[i,j,j],(i,))
     r_C = rho*div(u)
@@ -108,7 +113,8 @@ def interiorResidual(u,p,v,q,rho,mu,mesh,G=None,
                      C_I=Constant(3.0),
                      C_t=Constant(4.0),
                      stabScale=Constant(1.0),
-                     dx=dx):
+                     dx=dx,
+                     u_mesh=None):
     """
     This function returns the residual of the VMS formulation, minus 
     boundary terms, as a UFL ``Form``, with the assumption that boundary 
@@ -128,6 +134,8 @@ def interiorResidual(u,p,v,q,rho,mu,mesh,G=None,
     elements, and ``stabScale`` needs to be manipulated for use in 
     immersed-boundary methods.  A custom volume integration measure, 
     ``dx``, may also be specified.
+    Optional argument ``u_mesh`` is the mesh velocity, which may be given 
+    if an ALE-VMS formulation is used.
     """
 
     # Do a quick consistency check, to avoid a difficult-to-diagnose error:
@@ -138,9 +146,9 @@ def interiorResidual(u,p,v,q,rho,mu,mesh,G=None,
     if G == None:
         G = meshMetric(mesh)
     nu = mu/rho
-    tau_M, tau_C = stabilizationParameters(u,nu,G,C_I,C_t,Dt,stabScale)
-    DuDt = materialTimeDerivative(u,u_t,f)
-    r_M, r_C = strongResidual(u,p,mu,rho,u_t,f)
+    tau_M, tau_C = stabilizationParameters(u,nu,G,C_I,C_t,Dt,stabScale,u_mesh)
+    DuDt = materialTimeDerivative(u,u_t,f,u_mesh)
+    r_M, r_C = strongResidual(u,p,mu,rho,u_t,f,u_mesh)
 
     # Ansatz for fine scale velocity and pressure.  (Note that this is
     # somewhat of an abuse of notation, in that these are dimensionally-
@@ -152,14 +160,20 @@ def interiorResidual(u,p,v,q,rho,mu,mesh,G=None,
     uPrime = -tau_M*r_M
     pPrime = -tau_C*r_C
 
-    return (rho*inner(DuDt,v) + inner(sigma(u,p,mu),grad(v))
+    ires = (rho*inner(DuDt,v) + inner(sigma(u,p,mu),grad(v))
             + inner(div(u),q)
             - inner(dot(u,nabla_grad(v)) + grad(q)/rho, uPrime)
             - inner(pPrime,div(v))
             + inner(v,dot(uPrime,nabla_grad(u)))
             - inner(grad(v),outer(uPrime,uPrime))/rho)*dx
 
-def stableNeumannBC(traction,rho,u,v,n,g=None,ds=ds,gamma=Constant(1.0)):
+    if u_mesh != None:
+        ires +=  inner(dot(u_mesh,nabla_grad(v)) + grad(q)/rho, uPrime)
+
+    return ires
+
+def stableNeumannBC(traction,rho,u,v,n,g=None,ds=ds,gamma=Constant(1.0),
+                    u_mesh=None):
     """
     This function returns the boundary contribution of a stable Neumann BC
     corresponding to a boundary ``traction`` when the velocity ``u`` (with 
@@ -191,13 +205,17 @@ def stableNeumannBC(traction,rho,u,v,n,g=None,ds=ds,gamma=Constant(1.0)):
         u_minus_g = u
     else:
         u_minus_g = u-g
-    return -(inner(traction,v)
+    sres = -(inner(traction,v)
              + gamma*rho*ufl.Min(inner(u,n),Constant(0.0))
              *inner(u_minus_g,v))*ds
 
+    if u_mesh != None:
+        sres += gamma*rho*ufl.Min(inner(u_mesh,n),Constant(0.0))*inner(u_minus_g,v)*ds
+    return sres
+
 def weakDirichletBC(u,p,v,q,g,rho,mu,mesh,ds=ds,n_analytic=None,G=None,
                     sym=True,C_pen=Constant(1e3),
-                    overPenalize=False):
+                    overPenalize=False, u_mesh=None):
     """
     This returns the variational form corresponding to a weakly-enforced 
     velocity Dirichlet BC, with data ``g``, on the boundary measure
@@ -228,7 +246,8 @@ def weakDirichletBC(u,p,v,q,g,rho,mu,mesh,ds=ds,n_analytic=None,G=None,
     if G == None:
         G = meshMetric(mesh) # $\sim h^{-2}$
     traction = sigma(u,p,mu)*n
-    consistencyTerm = stableNeumannBC(traction,rho,u,v,n,g=g,ds=ds)
+    consistencyTerm = stableNeumannBC(traction,rho,u,v,n,g=g,ds=ds,
+                                      u_mesh=u_mesh)
     # Note sign of ``q``, negative for stability, regardless of ``sym``.
     adjointConsistency = -sgn*dot(sigma(v,-sgn*q,mu)*n,u-g)*ds
     penalty = C_pen*mu*sqrt(dot(n,G*n))*dot((u-g),v)*ds
