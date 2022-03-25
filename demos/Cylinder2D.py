@@ -4,7 +4,10 @@ in unsteady problems and demonstrating spatio-temporal convergence under
 quasi-uniform space--time refinement.  
 """
 from VarMINT import *
+from VarMINTpostproc import calc_force_coeffs
 import math
+import numpy as np
+from collections import defaultdict
 ####### Parameters #######
 
 # Arguments are parsed from the command line, with some hard-coded defaults
@@ -27,6 +30,8 @@ Re = Constant(float(args.Re))
 k = int(args.k)
 T = float(args.T)
 
+# store results
+results = defaultdict(list)
 ####### Analysis #######
 
 # Avoid overkill automatically-determined quadrature degree:
@@ -73,26 +78,7 @@ nu = mu/rho
 
 # Initial condition for the Taylor--Green vortex
 x = SpatialCoordinate(mesh)
-# u_IC = as_vector((sin(x[0])*cos(x[1]),-cos(x[0])*sin(x[1])))
 u_IC = as_vector((Constant(0.0),Constant(0.0)))
-
-# Time dependence of exact solution, evaluated at time T:
-solnT = exp(-2.0*nu*T)
-u_exact = solnT*u_IC
-
-# Expression for boundary condition:
-class solexp(UserExpression):
-    def __init__(self, nu, **kwargs):
-        super().__init__(kwargs)
-        self.t = 0.0
-        self.nu = nu
-    def eval(self, values, x):
-        texp = exp(-2.0*self.nu*self.t)
-        values[0] = sin(x[0])*cos(x[1])*texp
-        values[1] = -cos(x[0])*sin(x[1])*texp
-    def value_shape(self):
-        return (2,)
-solt = solexp(nu, degree=2)
 
 # Weak problem residual; note use of midpoint velocity:
 F = interiorResidual(u_mid,p,v,q,rho,mu,mesh,
@@ -120,14 +106,16 @@ bcs = [DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, 1),
        DirichletBC(V.sub(1), Constant(0.0), corner_str,"pointwise")]
 
 t = 0.0
+results['ts'].append(t)
+calc_force_coeffs(u,p,mu,n,ds(1),results)
+
 # Time stepping loop:
 with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
     for step in range(0,N_STEPS):
-        t += Dt
+        t += float(Dt)
         print("======= Time step "+str(step+1)+"/"+str(N_STEPS)+" =======")
 
         # Update dirichlet boundary condition:
-        solt.t = t
         solve(F==0,up,bcs=bcs)
         up_old.assign(up)
 
@@ -136,11 +124,8 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         pf.rename("Pressure","Pressure")
         fileu.write(uf, step)
         filep.write(pf, step)
+        results['ts'].append(t)
+        calc_force_coeffs(u,p,mu,n,ds(1),results)
+    np.savez("results", CD=np.array(results['c_ds']), CL=np.array(results['c_ls']), t=np.array(results['ts']))
 
-# Check error:
-def L2Norm(u):
-    return math.sqrt(assemble(inner(u,u)*dx))
-e_u = u - u_exact
-print("Element size = "+str(2.0*math.pi/Nel))
-print("H1 seminorm velocity error = "+str(L2Norm(grad(e_u))))
-print("L2 norm velocity error = "+str(L2Norm(e_u)))
+print("End of time loop.")
