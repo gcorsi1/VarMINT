@@ -45,6 +45,7 @@ with XDMFFile("mesh_turekCFD.xdmf") as file:
 
 mtot_ = MPI.sum(MPI.comm_world, mesh.num_cells())
 print(f"Read mesh with {mtot_} cells.")
+print(f"Mesh has hmax = {mesh.hmax()}, hmin = {mesh.hmin()}.")
 
 # Read boundary data
 mvc_boundaries = MeshValueCollection("size_t", mesh, mesh.topology().dim()-1)
@@ -148,8 +149,10 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         uf, pf = up.split(deepcopy=True)
         uf.rename("Velocity","Velocity")
         pf.rename("Pressure","Pressure")
-        fileu.write(uf, step)
-        filep.write(pf, step)
+        if not step % 200:
+            fileu.write(uf, step)
+            filep.write(pf, step)
+
         results['ts'].append(t)
         calc_force_coeffs(u,p,mu,n,ds(5),results,len_scale=0.1)
     np.savez("resultsTUREK", CD=np.array(results['c_ds']), CL=np.array(results['c_ls']), t=np.array(results['ts']))
