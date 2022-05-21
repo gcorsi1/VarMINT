@@ -49,7 +49,7 @@ dx = dx(metadata={"quadrature_degree": QUAD_DEG})
 
 # Domain:
 mesh = Mesh(MPI.comm_world)
-with XDMFFile("mesh_circleCFD.xdmf") as file:
+with XDMFFile("bfile_VIV.xdmf") as file:
     file.read(mesh)
 
 mtot_ = MPI.sum(MPI.comm_world, mesh.num_cells())
@@ -57,7 +57,7 @@ print(f"Read mesh with {mtot_} cells.")
 
 # Read boundary data
 mvc_boundaries = MeshValueCollection("size_t", mesh, mesh.topology().dim() - 1)
-with XDMFFile("mf_circleCFD.xdmf") as file:
+with XDMFFile("domains_VIV.xdmf") as file:
     file.read(mvc_boundaries)
 boundaries = cpp.mesh.MeshFunctionSizet(mesh, mvc_boundaries)
 ds = Measure("ds", domain=mesh, subdomain_data=boundaries)
@@ -154,11 +154,11 @@ bc_outlet = DirichletBC(V.sub(1), Constant(0.0), boundaries, outflow)
 bcs = [bc_inlet, bc_top, bc_bottom, bc_obstacle, bc_outlet]
 
 # Define boundary conditions for mesh motion
-bc_m_inlet = DirichletBC(VM, Constant(0.0), boundaries, inflow)
-bc_m_bottom = DirichletBC(VM, Constant(0.0), boundaries, bottom)
-bc_m_top = DirichletBC(VM, Constant(0.0), boundaries, top)
+bc_m_inlet = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, inflow)
+bc_m_bottom = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, bottom)
+bc_m_top = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, top)
 bc_m_obstacle = DirichletBC(VM, v_mesh, boundaries, ball)
-bc_m_outlet = DirichletBC(VM, Constant(0.0), boundaries, outflow)
+bc_m_outlet = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, outflow)
 bcs_m = [bc_m_inlet, bc_m_top, bc_m_bottom, bc_m_obstacle, bc_m_outlet]
 
 
@@ -179,7 +179,7 @@ F = interiorResidual(
 )
 
 a_m = inner(grad(s), grad(z)) * dx
-f_m = Constant(0.0) * z * dx
+f_m = inner(Constant((0.0, 0.0)), z) * dx
 
 t = 0.0
 results["ts"].append(t)

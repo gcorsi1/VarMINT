@@ -123,7 +123,7 @@ F = interiorResidual(
     mesh,
     u_t=u_t_alpha,
     Dt=Dt,
-    C_I=Constant(6.0 * (k ** 4)),
+    C_I=Constant(6.0 * (k**4)),
     dx=dx,
 )
 
