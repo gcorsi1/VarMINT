@@ -1,6 +1,6 @@
 """
-This demo solves the 2D Turek benchmark, using the generalized alpha method 
-of Jansen et al for time integration of the Navier-Stokes equations.  
+This demo solves the 2D VIV FSI problem introduced in the article of Peric 
+and Dettmer on CMAME (2006).  
 """
 from VarMINT import *
 from VarMINTpostproc import calc_force_coeffs
@@ -31,6 +31,7 @@ parser.add_argument(
     help="The rho_inf parameter in the generalized alpha method.",
 )
 
+
 args = parser.parse_args()
 Nel = int(args.Nel)
 Re = Constant(float(args.Re))
@@ -48,16 +49,15 @@ dx = dx(metadata={"quadrature_degree": QUAD_DEG})
 
 # Domain:
 mesh = Mesh(MPI.comm_world)
-with XDMFFile("mesh_turekCFD.xdmf") as file:
+with XDMFFile("mesh_circleCFD.xdmf") as file:
     file.read(mesh)
 
 mtot_ = MPI.sum(MPI.comm_world, mesh.num_cells())
 print(f"Read mesh with {mtot_} cells.")
-print(f"Mesh has hmax = {mesh.hmax()}, hmin = {mesh.hmin()}.")
 
 # Read boundary data
 mvc_boundaries = MeshValueCollection("size_t", mesh, mesh.topology().dim() - 1)
-with XDMFFile("mf_turekCFD.xdmf") as file:
+with XDMFFile("mf_circleCFD.xdmf") as file:
     file.read(mvc_boundaries)
 boundaries = cpp.mesh.MeshFunctionSizet(mesh, mvc_boundaries)
 ds = Measure("ds", domain=mesh, subdomain_data=boundaries)
@@ -112,6 +112,56 @@ class BoundaryFunction(UserExpression):
         return (2,)
 
 
+# Project the initial condition:
+up_old.assign(project(as_vector((u_IC[0], u_IC[1], Constant(0.0))), V))
+
+# Init all to zero
+for ui in (up, upt, upt_old):
+    ui.assign(up_old)
+
+# Mesh motion stuff
+VM = V.sub(0).collapse()
+s = TrialFunction(VM)
+z = TestFunction(VM)
+Sm = Function(VM)
+Sm0 = Function(VM)
+# v_mesh = Function(VM)
+omega = np.array([0.0, 0.0, 0.025])
+vte_x = Expression("Ux - omega_z*x[1]", Ux=0.0, omega_y=0.0, omega_z=0.0, degree=2)
+vte_y = Expression("Uy + omega_z*x[0]", Uy=0.0, omega_x=0.0, omega_z=0.0, degree=2)
+v_mesh = as_vector((vte_x, vte_y))
+
+# Project the initial condition:
+up_old.assign(project(as_vector((u_IC[0], u_IC[1], Constant(0.0))), V))
+
+# Same-velocity predictor:
+up.assign(up_old)
+
+# boundary markers
+ball = 1
+inflow = 2
+outflow = 3
+bottom = 4
+top = 5
+
+# Define boundary conditions
+U_inlet = BoundaryFunction(0.0)
+bc_inlet = DirichletBC(V.sub(0), U_inlet, boundaries, inflow)
+bc_bottom = DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, bottom)
+bc_top = DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, top)
+bc_obstacle = DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, ball)
+bc_outlet = DirichletBC(V.sub(1), Constant(0.0), boundaries, outflow)
+bcs = [bc_inlet, bc_top, bc_bottom, bc_obstacle, bc_outlet]
+
+# Define boundary conditions for mesh motion
+bc_m_inlet = DirichletBC(VM, Constant(0.0), boundaries, inflow)
+bc_m_bottom = DirichletBC(VM, Constant(0.0), boundaries, bottom)
+bc_m_top = DirichletBC(VM, Constant(0.0), boundaries, top)
+bc_m_obstacle = DirichletBC(VM, v_mesh, boundaries, ball)
+bc_m_outlet = DirichletBC(VM, Constant(0.0), boundaries, outflow)
+bcs_m = [bc_m_inlet, bc_m_top, bc_m_bottom, bc_m_obstacle, bc_m_outlet]
+
+
 # Weak problem residual; note use of midpoint velocity:
 F = interiorResidual(
     u_alpha,
@@ -123,70 +173,57 @@ F = interiorResidual(
     mesh,
     u_t=u_t_alpha,
     Dt=Dt,
-    C_I=Constant(6.0 * (k ** 4)),
+    C_I=Constant(6.0 * (k**4)),
     dx=dx,
+    u_mesh=v_mesh,
 )
 
-# Project the initial condition:
-up_old.assign(project(as_vector((u_IC[0], u_IC[1], Constant(0.0))), V))
-
-# Init all to zero
-for ui in (up, upt, upt_old):
-    ui.assign(up_old)
-
-
-# Set no-penetration BCs on velocity and pin down pressure in one corner:
-inflow = 2
-outflow = 3
-walls = 4
-obstacle = 5
-
-# Define boundary conditions
-U_inlet = BoundaryFunction(0.0)
-bc_inlet = DirichletBC(V.sub(0), U_inlet, boundaries, inflow)
-bc_walls = DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, walls)
-bc_obstacle = DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, obstacle)
-bc_outlet = DirichletBC(V.sub(1), Constant(0.0), boundaries, outflow)
-bcs = [bc_inlet, bc_walls, bc_obstacle, bc_outlet]
+a_m = inner(grad(s), grad(z)) * dx
+f_m = Constant(0.0) * z * dx
 
 t = 0.0
 results["ts"].append(t)
-calc_force_coeffs(u, p, mu, n, ds(5), results, len_scale=0.1)
 
 # Time stepping loop:
 with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
+
+    fileu.parameters.update(
+        {"functions_share_mesh": True, "rewrite_function_mesh": True}
+    )
+
+    filep.parameters.update(
+        {"functions_share_mesh": True, "rewrite_function_mesh": True}
+    )
+
     for step in range(0, N_STEPS):
         t += float(Dt)
         print("======= Time step " + str(step + 1) + "/" + str(N_STEPS) + " =======")
 
-        # Predictor step, velocity assumed to be the same, notice that it
-        # is ut_old that is used in the calculation of the intermediate alpha
-        # variables
-        upt_old.assign(upt)
-        # upt_old.assign((gamma_f - 1.0) / gamma_f * upt)
-
         # Update dirichlet boundary condition:
-        U_inlet.t = t
-        solve(F == 0, up, bcs=bcs)
+        vte_x.omega_z = omega[2]
+        vte_y.omega_z = omega[2]
 
-        # Corrector step
-        upt.assign(
-            1.0 / float(Dt) / gamma_f * (up - up_old)
-            - (1.0 - gamma_f) / gamma_f * upt_old
-        )
+        Am, Lm = assemble_system(a_m, f_m, bcs_m)
+        Sm0.vector().zero()
+        Sm0.vector().axpy(1.0, Sm.vector())
+        solve(a_m == f_m, Sm, bcs=bcs_m)
+        print("CALLING ALE MOVE.")
+        # Move mesh
+        ALE.move(mesh, Sm)
+
+        solve(F == 0, up, bcs=bcs)
         up_old.assign(up)
 
         uf, pf = up.split(deepcopy=True)
         uf.rename("Velocity", "Velocity")
         pf.rename("Pressure", "Pressure")
-        if not step % 20:
-            fileu.write(uf, step)
-            filep.write(pf, step)
+        fileu.write(uf, step)
+        filep.write(pf, step)
 
         results["ts"].append(t)
-        calc_force_coeffs(u, p, mu, n, ds(5), results, len_scale=0.1)
+        calc_force_coeffs(u, p, mu, n, ds(1), results)
     np.savez(
-        "resultsTUREK",
+        "resultsALE",
         CD=np.array(results["c_ds"]),
         CL=np.array(results["c_ls"]),
         t=np.array(results["ts"]),
