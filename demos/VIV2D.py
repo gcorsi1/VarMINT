@@ -202,6 +202,7 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         # Update dirichlet boundary condition:
         vte_x.omega_z = omega[2]
         vte_y.omega_z = omega[2]
+        U_inlet.t = t
 
         Am, Lm = assemble_system(a_m, f_m, bcs_m)
         Sm0.vector().zero()
