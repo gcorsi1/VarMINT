@@ -3,8 +3,7 @@ This demo solves the 2D VIV FSI problem introduced in the article of Peric
 and Dettmer on CMAME (2006).  
 """
 from VarMINT import *
-from VarMINTpostproc import calc_force_coeffs
-import math
+from VarMINTpostproc import integrate_force
 import numpy as np
 from collections import defaultdict
 
@@ -96,21 +95,9 @@ u_t_alpha = (1.0 - alpha_mf / gamma_f) * ut_old + alpha_mf / Dt / gamma_f * (u -
 # Initial condition for the Taylor--Green vortex
 x = SpatialCoordinate(mesh)
 u_IC = as_vector((Constant(0.0), Constant(0.0)))
-
-
-class BoundaryFunction(UserExpression):
-    def __init__(self, t, **kwargs):
-        super().__init__(**kwargs)
-        self.t = t
-
-    def eval(self, values, x):
-        U = 1.5 * sin(pi * self.t / 8)
-        values[0] = 4 * U * x[1] * (0.41 - x[1]) / pow(0.41, 2)
-        values[1] = 0
-
-    def value_shape(self):
-        return (2,)
-
+vbc = Expression(
+    "t < 4.0 ? U*(1-std::cos(3.14142/2.0*t))/2.0 : U", U=1.0, t=0.0, degree=2
+)  # ------INLET WITH STARTUP PROFILE
 
 # Project the initial condition:
 up_old.assign(project(as_vector((u_IC[0], u_IC[1], Constant(0.0))), V))
@@ -124,12 +111,12 @@ VM = V.sub(0).collapse()
 s = TrialFunction(VM)
 z = TestFunction(VM)
 Sm = Function(VM)
-Sm0 = Function(VM)
-# v_mesh = Function(VM)
-omega = np.array([0.0, 0.0, 0.025])
+v_mesh = Function(VM)
+v_mesh_old = Function(VM)
+# rigid velocity expression
 vte_x = Expression("Ux - omega_z*x[1]", Ux=0.0, omega_y=0.0, omega_z=0.0, degree=2)
 vte_y = Expression("Uy + omega_z*x[0]", Uy=0.0, omega_x=0.0, omega_z=0.0, degree=2)
-v_mesh = as_vector((vte_x, vte_y))
+v_mesh_exp = as_vector((vte_x, vte_y))
 
 # Project the initial condition:
 up_old.assign(project(as_vector((u_IC[0], u_IC[1], Constant(0.0))), V))
@@ -145,21 +132,18 @@ bottom = 4
 top = 5
 
 # Define boundary conditions
-U_inlet = BoundaryFunction(0.0)
-bc_inlet = DirichletBC(V.sub(0), U_inlet, boundaries, inflow)
+bc_inlet = DirichletBC(V.sub(0), vbc, boundaries, inflow)
 bc_bottom = DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, bottom)
 bc_top = DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, top)
-bc_obstacle = DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, ball)
 bc_outlet = DirichletBC(V.sub(1), Constant(0.0), boundaries, outflow)
-bcs = [bc_inlet, bc_top, bc_bottom, bc_obstacle, bc_outlet]
+bcs = [bc_inlet, bc_top, bc_bottom, bc_outlet]
 
 # Define boundary conditions for mesh motion
 bc_m_inlet = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, inflow)
 bc_m_bottom = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, bottom)
 bc_m_top = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, top)
-bc_m_obstacle = DirichletBC(VM, v_mesh, boundaries, ball)
 bc_m_outlet = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, outflow)
-bcs_m = [bc_m_inlet, bc_m_top, bc_m_bottom, bc_m_obstacle, bc_m_outlet]
+bcs_m = [bc_m_inlet, bc_m_top, bc_m_bottom, bc_m_outlet]
 
 
 # Weak problem residual; note use of midpoint velocity:
@@ -173,13 +157,71 @@ F = interiorResidual(
     mesh,
     u_t=u_t_alpha,
     Dt=Dt,
-    C_I=Constant(6.0 * (k**4)),
+    C_I=Constant(6.0 * (k ** 4)),
     dx=dx,
     u_mesh=v_mesh,
 )
 
 a_m = inner(grad(s), grad(z)) * dx
 f_m = inner(Constant((0.0, 0.0)), z) * dx
+
+# SOLID PROBLEM
+N = 2
+y, ydot, yddot = [np.zeros(N) for _ in range(3)]
+y_old, ydot_old, yddot_old = [np.zeros(N) for _ in range(3)]
+
+# for now, rhoinf is set to be the same as that of the fluid
+rhoinf_r = rhoinf
+alpha_fr = 1.0 / (1.0 + rhoinf_r)
+alpha_mr = (2.0 - rhoinf_r) / (1.0 + rhoinf_r)
+beta_r = 0.25 * (1 + alpha_mr - alpha_fr) ** 2
+gamma_r = 0.5 + alpha_mr - alpha_fr
+C = np.array([0.01])  # SOLID DISSIPATION
+K = np.array([0.215 * 2 * pi])  # SOLID STIFFNESS PARAMETER
+M = np.array([1.0])  # SOLID MASS
+
+
+def solid_step(
+    alpha_fr, alpha_mr, beta_r, gamma_r, Dt, M, C, K, Fext, y_old, ydot_old, yddot_old
+):
+    """
+    advance in time following the generalized alpha method, as written by Peric
+    results in the new value of solid velocity
+    """
+    resd = (
+        2 * M @ (Dt * yddot_old + ydot_old) * alpha_mr
+        - 2 * Dt * (M @ yddot_old + gamma_r * (-Fext + K @ y_old + C @ ydot_old))
+        + Dt
+        * alpha_fr
+        * (
+            2 * Dt * K @ (Dt * yddot_old + ydot_old) * beta_r
+            - gamma_r
+            * (Dt ** 2 * K @ yddot_old - 2 * C @ ydot_old + 2 * Dt * K @ ydot_old)
+        )
+    )
+    mat = 2 * (alpha_mr * M + Dt * alpha_fr * (Dt * beta_r * K + gamma_r * C))
+    invmat = 1.0 / mat if len(mat.shape) == 1 else np.linalg.inv(mat)
+    ydot_new = invmat @ resd
+    # recast to np.array if needed (ie if the ode is 1d and result is a float)
+    return np.array(ydot_new)
+
+
+def solid_corrector(beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old):
+    """
+    given value of solid velocity at new time, calculate the acceleration and
+    displacement
+    """
+    y_new = (
+        y_old
+        + Dt * (gamma_r - beta_r) / gamma_r * ydot_old
+        + Dt ** 2 * (gamma_r - 2 * beta_r) / 2 / gamma_r * yddot_old
+        + Dt * beta_r / gamma_r * ydot
+    )
+    yddot_new = -(1 - gamma_r) / gamma_r * yddot_old + 1.0 / Dt / gamma_r * (
+        ydot - ydot_old
+    )
+    return y_new, yddot_new
+
 
 t = 0.0
 results["ts"].append(t)
@@ -199,21 +241,65 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         t += float(Dt)
         print("======= Time step " + str(step + 1) + "/" + str(N_STEPS) + " =======")
 
-        # Update dirichlet boundary condition:
-        vte_x.omega_z = omega[2]
-        vte_y.omega_z = omega[2]
-        U_inlet.t = t
+        np.copyto(y_old, y)
+        np.copyto(ydot_old, ydot)
+        np.copyto(yddot_old, yddot)
+        Fext = integrate_force(u, p, mu, mesh, ds, 1)
+        ydot_new = solid_step(
+            alpha_fr,
+            alpha_mr,
+            beta_r,
+            gamma_r,
+            Dt,
+            M,
+            C,
+            K,
+            Fext,
+            y_old,
+            ydot_old,
+            yddot_old,
+        )
+        bc_m_obstacle = DirichletBC(VM, v_mesh_exp, boundaries, ball)
+        np.copyto(ydot, ydot_new)
 
-        Am, Lm = assemble_system(a_m, f_m, bcs_m)
-        Sm0.vector().zero()
-        Sm0.vector().axpy(1.0, Sm.vector())
-        solve(a_m == f_m, Sm, bcs=bcs_m)
+        # lift velocity at interface
+        # Am, Lm = assemble_system(a_m, f_m, bcs_m)
+        v_mesh_old.vector().zero()
+        v_mesh_old.vector().axpy(1.0, v_mesh.vector())
+        solve(a_m == f_m, v_mesh, bcs=bcs_m + [bc_m_obstacle])
         print("CALLING ALE MOVE.")
+        Sm.vector().zero()
+        # Trapezoidal rule
+        Sm.vector().axpy(Dt / 2.0, v_mesh.vector())
+        Sm.vector().axpy(Dt / 2.0, v_mesh_old.vector())
         # Move mesh
         ALE.move(mesh, Sm)
 
-        solve(F == 0, up, bcs=bcs)
+        # Now advance fluid in time
+        # Update dirichlet boundary condition:
+        vte_y.Uy = ydot_new[1]
+        vbc.t = t
+        bc_obstacle = DirichletBC(V.sub(0), v_mesh, boundaries, ball)
+
+        solve(F == 0, up, bcs=bcs + [bc_obstacle])
+        # Corrector step
+        upt.assign(
+            1.0 / float(Dt) / gamma_f * (up - up_old)
+            - (1.0 - gamma_f) / gamma_f * upt_old
+        )
         up_old.assign(up)
+        np.copyto(
+            y,
+            y_old
+            + Dt * (gamma_r - beta_r) / gamma_r * ydot_old
+            + Dt ** 2 * (gamma_r - 2 * beta_r) / 2.0 / gamma_r * yddot_old
+            + Dt * beta_r / gamma_r * ydot,
+        )
+        np.copyto(
+            yddot,
+            -(1.0 - gamma_r) / gamma_r * yddot_old
+            + 1.0 / Dt / gamma_r * (ydot - ydot_old),
+        )
 
         uf, pf = up.split(deepcopy=True)
         uf.rename("Velocity", "Velocity")
@@ -222,12 +308,6 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         filep.write(pf, step)
 
         results["ts"].append(t)
-        calc_force_coeffs(u, p, mu, n, ds(1), results)
-    np.savez(
-        "resultsALE",
-        CD=np.array(results["c_ds"]),
-        CL=np.array(results["c_ls"]),
-        t=np.array(results["ts"]),
-    )
+        results["disp_y"].append(y[1])
 
 print("End of time loop.")
