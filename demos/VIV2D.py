@@ -83,7 +83,7 @@ gamma_f = 0.5 + alpha_mf - alpha_ff
 
 # Generalized alpha time integration:
 N_STEPS = Nel  # Space--time quasi-uniformity
-Dt = Constant(T / N_STEPS)
+Dt = float(T / N_STEPS)
 up_old = Function(V)
 upt, upt_old = (Function(V), Function(V))
 ut, _ = split(upt)
@@ -96,7 +96,7 @@ u_t_alpha = (1.0 - alpha_mf / gamma_f) * ut_old + alpha_mf / Dt / gamma_f * (u -
 x = SpatialCoordinate(mesh)
 u_IC = as_vector((Constant(0.0), Constant(0.0)))
 vbc = Expression(
-    "t < 4.0 ? U*(1-std::cos(3.14142/2.0*t))/2.0 : U", U=1.0, t=0.0, degree=2
+    ("t < 4.0 ? U*(1-std::cos(3.14142/2.0*t))/2.0 : U", "0.0"), U=1.0, t=0.0, degree=2
 )  # ------INLET WITH STARTUP PROFILE
 
 # Project the initial condition:
@@ -145,7 +145,6 @@ bc_m_top = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, top)
 bc_m_outlet = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, outflow)
 bcs_m = [bc_m_inlet, bc_m_top, bc_m_bottom, bc_m_outlet]
 
-
 # Weak problem residual; note use of midpoint velocity:
 F = interiorResidual(
     u_alpha,
@@ -157,7 +156,7 @@ F = interiorResidual(
     mesh,
     u_t=u_t_alpha,
     Dt=Dt,
-    C_I=Constant(6.0 * (k ** 4)),
+    C_I=Constant(6.0 * (k**4)),
     dx=dx,
     u_mesh=v_mesh,
 )
@@ -176,9 +175,11 @@ alpha_fr = 1.0 / (1.0 + rhoinf_r)
 alpha_mr = (2.0 - rhoinf_r) / (1.0 + rhoinf_r)
 beta_r = 0.25 * (1 + alpha_mr - alpha_fr) ** 2
 gamma_r = 0.5 + alpha_mr - alpha_fr
-C = np.array([0.01])  # SOLID DISSIPATION
-K = np.array([0.215 * 2 * pi])  # SOLID STIFFNESS PARAMETER
-M = np.array([1.0])  # SOLID MASS
+C = np.array([[0.01, 0.0], [0.0, 0.01]])  # SOLID DISSIPATION
+K = np.array(
+    [[0.215 * 2 * pi, 0.0], [0.0, 0.215 * 2 * pi]]
+)  # SOLID STIFFNESS PARAMETER
+M = np.array([[1.0, 0.0], [0.0, 1.0]])  # SOLID MASS
 
 
 def solid_step(
@@ -189,14 +190,14 @@ def solid_step(
     results in the new value of solid velocity
     """
     resd = (
-        2 * M @ (Dt * yddot_old + ydot_old) * alpha_mr
+        2 * alpha_mr * M @ (Dt * yddot_old + ydot_old)
         - 2 * Dt * (M @ yddot_old + gamma_r * (-Fext + K @ y_old + C @ ydot_old))
         + Dt
         * alpha_fr
         * (
             2 * Dt * K @ (Dt * yddot_old + ydot_old) * beta_r
             - gamma_r
-            * (Dt ** 2 * K @ yddot_old - 2 * C @ ydot_old + 2 * Dt * K @ ydot_old)
+            * (Dt**2 * K @ yddot_old - 2 * C @ ydot_old + 2 * Dt * K @ ydot_old)
         )
     )
     mat = 2 * (alpha_mr * M + Dt * alpha_fr * (Dt * beta_r * K + gamma_r * C))
@@ -214,7 +215,7 @@ def solid_corrector(beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old):
     y_new = (
         y_old
         + Dt * (gamma_r - beta_r) / gamma_r * ydot_old
-        + Dt ** 2 * (gamma_r - 2 * beta_r) / 2 / gamma_r * yddot_old
+        + Dt**2 * (gamma_r - 2 * beta_r) / 2 / gamma_r * yddot_old
         + Dt * beta_r / gamma_r * ydot
     )
     yddot_new = -(1 - gamma_r) / gamma_r * yddot_old + 1.0 / Dt / gamma_r * (
@@ -244,7 +245,10 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         np.copyto(y_old, y)
         np.copyto(ydot_old, ydot)
         np.copyto(yddot_old, yddot)
-        Fext = integrate_force(u, p, mu, mesh, ds, 1)
+        Fext = -1.0 * integrate_force(u, p, mu, mesh, ds, 1)
+        Fext[0] = 0.0
+        if t < 0.5:
+            Fext[1] = 0.0
         ydot_new = solid_step(
             alpha_fr,
             alpha_mr,
@@ -259,8 +263,9 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             ydot_old,
             yddot_old,
         )
-        bc_m_obstacle = DirichletBC(VM, v_mesh_exp, boundaries, ball)
         np.copyto(ydot, ydot_new)
+        vte_y.Uy = ydot[1]
+        bc_m_obstacle = DirichletBC(VM, v_mesh_exp, boundaries, ball)
 
         # lift velocity at interface
         # Am, Lm = assemble_system(a_m, f_m, bcs_m)
@@ -277,7 +282,6 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
 
         # Now advance fluid in time
         # Update dirichlet boundary condition:
-        vte_y.Uy = ydot_new[1]
         vbc.t = t
         bc_obstacle = DirichletBC(V.sub(0), v_mesh, boundaries, ball)
 
@@ -288,18 +292,11 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             - (1.0 - gamma_f) / gamma_f * upt_old
         )
         up_old.assign(up)
-        np.copyto(
-            y,
-            y_old
-            + Dt * (gamma_r - beta_r) / gamma_r * ydot_old
-            + Dt ** 2 * (gamma_r - 2 * beta_r) / 2.0 / gamma_r * yddot_old
-            + Dt * beta_r / gamma_r * ydot,
+        y_new, yddot_new = solid_corrector(
+            beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old
         )
-        np.copyto(
-            yddot,
-            -(1.0 - gamma_r) / gamma_r * yddot_old
-            + 1.0 / Dt / gamma_r * (ydot - ydot_old),
-        )
+        np.copyto(y, y_new)
+        np.copyto(yddot, yddot_new)
 
         uf, pf = up.split(deepcopy=True)
         uf.rename("Velocity", "Velocity")
