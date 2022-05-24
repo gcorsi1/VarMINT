@@ -182,7 +182,27 @@ K = np.array(
 M = np.array([[1.0, 0.0], [0.0, 1.0]])  # SOLID MASS
 
 
-def solid_step(
+def solid_alpha(
+    alpha_fr, alpha_mr, beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old
+):
+    """
+    extrapolated quantities, from old time values, for generalized alpha
+    method of time integration
+    """
+    y_alpha = (
+        y_old
+        + Dt * alpha_fr * (gamma_r - beta_r) / gamma_r * ydot_old
+        + Dt**2 * alpha_fr * (gamma_r - 2 * beta_r) / 2.0 / gamma_r * yddot_old
+        + Dt * alpha_fr * beta_r / gamma_r * ydot
+    )
+    ydot_alpha = (1 - alpha_fr) * ydot_old + alpha_fr * ydot
+    yddot_alpha = (1.0 - alpha_mr) / gamma_r * yddot_old + alpha_mr / Dt / gamma_r * (
+        ydot - ydot_old
+    )
+    return y_alpha, ydot_alpha, yddot_alpha
+
+
+def solid_step_linear(
     alpha_fr, alpha_mr, beta_r, gamma_r, Dt, M, C, K, Fext, y_old, ydot_old, yddot_old
 ):
     """

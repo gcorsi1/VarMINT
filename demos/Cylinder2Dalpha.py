@@ -9,6 +9,13 @@ import math
 import numpy as np
 from collections import defaultdict
 
+import matplotlib
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+
+matplotlib.use("Agg")
+
 ####### Parameters #######
 
 # Arguments are parsed from the command line, with some hard-coded defaults
@@ -49,7 +56,7 @@ dx = dx(metadata={"quadrature_degree": QUAD_DEG})
 
 # Domain:
 mesh = Mesh(MPI.comm_world)
-with XDMFFile("mesh_turekCFD.xdmf") as file:
+with XDMFFile("bfile_VIV.xdmf") as file:
     file.read(mesh)
 
 mtot_ = MPI.sum(MPI.comm_world, mesh.num_cells())
@@ -58,7 +65,7 @@ print(f"Mesh has hmax = {mesh.hmax()}, hmin = {mesh.hmin()}.")
 
 # Read boundary data
 mvc_boundaries = MeshValueCollection("size_t", mesh, mesh.topology().dim() - 1)
-with XDMFFile("mf_turekCFD.xdmf") as file:
+with XDMFFile("domains_VIV.xdmf") as file:
     file.read(mvc_boundaries)
 boundaries = cpp.mesh.MeshFunctionSizet(mesh, mvc_boundaries)
 ds = Measure("ds", domain=mesh, subdomain_data=boundaries)
@@ -94,26 +101,25 @@ u_old, _ = split(up_old)
 u_alpha = alpha_ff * u + (1.0 - alpha_ff) * u_old
 u_t_alpha = (1.0 - alpha_mf / gamma_f) * ut_old + alpha_mf / Dt / gamma_f * (u - u_old)
 
-# Initial condition for the Taylor--Green vortex
-x = SpatialCoordinate(mesh)
-u_IC = as_vector((Constant(0.0), Constant(0.0)))
-
 
 class BoundaryFunction(UserExpression):
-    def __init__(self, t, **kwargs):
+    def __init__(self, t, ramp_end_t, **kwargs):
         super().__init__(**kwargs)
         self.t = t
+        self.ramp_end_t = ramp_end_t
 
+    # simple linear time ramp
     def eval(self, values, x):
-        U = 1.5 * sin(pi * self.t / 8)
-        values[0] = 4 * U * x[1] * (0.41 - x[1]) / pow(0.41, 2)
-        values[1] = 0
+        U = 1.0 * (self.t - self.ramp_end_t) if self.t < self.ramp_end_t else 1.0
+        V = 0.01 if self.t < self.ramp_end_t else 0.0  # small disturbance 
+        values[0] = U
+        values[1] = V
 
     def value_shape(self):
         return (2,)
 
 
-# Weak problem residual; note use of midpoint velocity:
+# Weak problem residual; note use of alpha intermediate velocity
 F = interiorResidual(
     u_alpha,
     p,
@@ -129,6 +135,7 @@ F = interiorResidual(
 )
 
 # Project the initial condition:
+u_IC = as_vector((Constant(0.0), Constant(0.0)))
 up_old.assign(project(as_vector((u_IC[0], u_IC[1], Constant(0.0))), V))
 
 # Init all to zero
@@ -144,16 +151,74 @@ bottom = 4
 top = 5
 
 # Define boundary conditions
-U_inlet = BoundaryFunction(0.0)
+U_inlet = BoundaryFunction(0.0, ramp_end_t=0.5)
 bc_inlet = DirichletBC(V.sub(0), U_inlet, boundaries, inflow)
-bc_walls = DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, walls)
+bc_bottom = DirichletBC(V.sub(0).sub(1), Constant(0.0), boundaries, bottom)
+bc_top = DirichletBC(V.sub(0).sub(1), Constant(0.0), boundaries, top)
 bc_obstacle = DirichletBC(V.sub(0), Constant((0.0, 0.0)), boundaries, obstacle)
 bc_outlet = DirichletBC(V.sub(1), Constant(0.0), boundaries, outflow)
-bcs = [bc_inlet, bc_walls, bc_obstacle, bc_outlet]
+bcs = [bc_inlet, bc_bottom, bc_top, bc_obstacle, bc_outlet]
+
+# define the functions that will be used to integrate the forces on the
+# cylinder variationally, these will be equal to a cartesian base vector on
+# the surface of the cylinder, and 0 on the other Dirichlet boundaries
+VM = V.sub(0).collapse()
+QM = V.sub(1).collapse()
+bc_m_inlet = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, inflow)
+bc_m_bottom = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, bottom)
+bc_m_top = DirichletBC(VM, Constant((0.0, 0.0)), boundaries, top)
+bc_m_obstacle_e0 = DirichletBC(VM, Constant((1.0, 0.0)), boundaries, obstacle)
+bc_m_obstacle_e1 = DirichletBC(VM, Constant((0.0, 1.0)), boundaries, obstacle)
+bcs_m = [bc_m_inlet, bc_m_bottom, bc_m_top]
+z = TrialFunction(VM)
+s = TestFunction(VM)
+a_m = inner(grad(z), grad(s)) * dx
+f_m = dot(Constant((0.0, 0.0)), s) * dx
+eis = [Function(VM) for _ in range(mesh.geometry().dim())]
+
+# solve an auxiliary laplacian problem in order to calculate the e_i
+# and define a zero function to be used for the pressure test function
+for eii, bci in zip(eis, [bc_m_obstacle_e0, bc_m_obstacle_e1]):
+    solve(a_m == f_m, eii, bcs=bcs_m + [bci])
+q0 = Function(QM)
+q0.assign(project(Constant(0.0), QM))
 
 t = 0.0
-results["ts"].append(t)
-calc_force_coeffs_turek(u, p, mu, n, ds(5), results, len_scale=0.1)
+results["t"].append(t)
+
+# Calculate force variationally
+F0 = interiorResidual(
+    u,
+    p,
+    eis[0],
+    q0,
+    rho,
+    mu,
+    mesh,
+    u_t=ut,
+    Dt=Dt,
+    C_I=Constant(6.0 * (k**4)),
+    dx=dx,
+)
+
+# Calculate force variationally
+F1 = interiorResidual(
+    u,
+    p,
+    eis[1],
+    q0,
+    rho,
+    mu,
+    mesh,
+    u_t=ut,
+    Dt=Dt,
+    C_I=Constant(6.0 * (k**4)),
+    dx=dx,
+)
+
+results["CD"].append(2.0 * assemble(F0))
+results["CL"].append(2.0 * assemble(F1))
+results["freq"].append(0.0)
 
 # Time stepping loop:
 with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
@@ -164,8 +229,8 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         # Predictor step, velocity assumed to be the same, notice that it
         # is ut_old that is used in the calculation of the intermediate alpha
         # variables
-        upt_old.assign(upt)
         # upt_old.assign((gamma_f - 1.0) / gamma_f * upt)
+        upt_old.assign(upt)
 
         # Update dirichlet boundary condition:
         U_inlet.t = t
@@ -185,13 +250,45 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             fileu.write(uf, step)
             filep.write(pf, step)
 
-        results["ts"].append(t)
-        calc_force_coeffs_turek(u, p, mu, n, ds(5), results, len_scale=0.1)
-    np.savez(
-        "resultsTUREK",
-        CD=np.array(results["c_ds"]),
-        CL=np.array(results["c_ls"]),
-        t=np.array(results["ts"]),
-    )
+        results["t"].append(t)
+        results["CD"].append(2.0 * assemble(F0))
+        results["CL"].append(2.0 * assemble(F1))
+
+        # calculate the main frequency of oscillation
+        Ntot = len(results["CL"])
+        ws = np.fft.fft(results["CL"])
+        Ttot = results["t"][-1]
+        dfs = 1.0 / Ttot
+        freqs = np.fft.fftfreq(Ntot) * Ntot * dfs
+        idx = np.argmax(np.abs(ws))
+        maxf = np.abs(freqs[idx])
+        if (MPI.rank(MPI.comm_world) == 0):
+            print(f"main frequency sampled from data is: {maxf:.2f}")
+        results["freq"].append(maxf)
 
 print("End of time loop.")
+
+# end run postprocessing
+
+data_preproc = pd.DataFrame.from_dict(results)
+data_preproc.to_csv("./raw_data.csv")
+
+fade_ = 1  # DOWNSAMPLE FACTOR FOR THE PLOTS
+data_preproc = data_preproc.iloc[1::fade_, :]  # only get some of the rows in the plot
+# for plots, remove initial seconds where pressure wave gives spurious 
+# very high values
+data_preproc = data_preproc[data_preproc.t > 3]
+g = sns.lineplot( x="t", y="value", hue="variable", hue_order=["CL", "CD"], marker="o", data=pd.melt(data_preproc, ["t"]),)
+# g = sns.lineplot(x="t", y="Fy", marker="o", data=data_preproc)
+# g = sns.lineplot(x="t", y="Fx", marker="o", data=data_preproc)
+sns.despine()
+plt.xlabel(r"$t [s]$")
+plt.ylabel("")
+plt.legend(
+    title="Coefficient",
+    bbox_to_anchor=(0.9, 0.9),
+    loc=2,
+    labels=[r"$C_L$", r"$C_D$"],
+)
+plt.savefig("./coefficients.pdf")
+plt.close()
