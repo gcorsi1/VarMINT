@@ -230,7 +230,6 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         # is ut_old that is used in the calculation of the intermediate alpha
         # variables
         # upt_old.assign((gamma_f - 1.0) / gamma_f * upt)
-        upt_old.assign(upt)
 
         # Update dirichlet boundary condition:
         U_inlet.t = t
@@ -242,6 +241,7 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             - (1.0 - gamma_f) / gamma_f * upt_old
         )
         up_old.assign(up)
+        upt_old.assign(upt)
 
         uf, pf = up.split(deepcopy=True)
         uf.rename("Velocity", "Velocity")
