@@ -156,7 +156,7 @@ F = interiorResidual(
     mesh,
     u_t=u_t_alpha,
     Dt=Dt,
-    C_I=Constant(6.0 * (k**4)),
+    C_I=Constant(6.0 * (k ** 4)),
     dx=dx,
     u_mesh=v_mesh,
 )
@@ -175,11 +175,22 @@ alpha_fr = 1.0 / (1.0 + rhoinf_r)
 alpha_mr = (2.0 - rhoinf_r) / (1.0 + rhoinf_r)
 beta_r = 0.25 * (1 + alpha_mr - alpha_fr) ** 2
 gamma_r = 0.5 + alpha_mr - alpha_fr
-C = np.array([[0.01, 0.0], [0.0, 0.01]])  # SOLID DISSIPATION
-K = np.array(
-    [[0.215 * 2 * pi, 0.0], [0.0, 0.215 * 2 * pi]]
-)  # SOLID STIFFNESS PARAMETER
-M = np.array([[1.0, 0.0], [0.0, 1.0]])  # SOLID MASS
+
+
+def Mm():
+    return np.array([[1.0, 0.0], [0.0, 1.0]])
+
+
+def Km():
+    return np.array([[0.215 * 2 * pi, 0.0], [0.0, 0.215 * 2 * pi]])
+
+
+def Cm():
+    return np.array([[0.01, 0.0], [0.0, 0.01]])
+
+
+def restoring_force(disp, velocity):
+    return Cm() @ velocity + Km() @ disp
 
 
 def solid_alpha(
@@ -192,7 +203,7 @@ def solid_alpha(
     y_alpha = (
         y_old
         + Dt * alpha_fr * (gamma_r - beta_r) / gamma_r * ydot_old
-        + Dt**2 * alpha_fr * (gamma_r - 2 * beta_r) / 2.0 / gamma_r * yddot_old
+        + Dt ** 2 * alpha_fr * (gamma_r - 2 * beta_r) / 2.0 / gamma_r * yddot_old
         + Dt * alpha_fr * beta_r / gamma_r * ydot
     )
     ydot_alpha = (1 - alpha_fr) * ydot_old + alpha_fr * ydot
@@ -202,12 +213,79 @@ def solid_alpha(
     return y_alpha, ydot_alpha, yddot_alpha
 
 
+def solid_step_nonlinear(
+    alpha_fr,
+    alpha_mr,
+    beta_r,
+    gamma_r,
+    Dt,
+    Mm,
+    Cm,
+    Km,
+    Fext,
+    ydot,
+    y_old,
+    ydot_old,
+    yddot_old,
+    logs=False,
+):
+    """
+    advance in time following the generalized alpha method, as written by Peric
+    results in the new value of solid velocity. Assume the general case when
+    the solid ODE has a nonlinear component, depending on velocity and
+    displacements (linear in the accelerations)
+    """
+    # predictor step
+    y_alpha = (
+        y_old
+        + Dt * alpha_fr * (gamma_r - beta_r) / gamma_r * ydot_old
+        + Dt ** 2 * alpha_fr * (gamma_r - 2 * beta_r) / 2.0 / gamma_r * yddot_old
+        + Dt * alpha_fr * beta_r / gamma_r * ydot
+    )
+    ydot_alpha = (1 - alpha_fr) * ydot_old + alpha_fr * ydot
+    yddot_alpha = (1.0 - alpha_mr) / gamma_r * yddot_old + alpha_mr / Dt / gamma_r * (
+        ydot - ydot_old
+    )
+    # residual of the nonlinear ODE
+    eps = Fext - restoring_force(y_alpha, ydot_alpha) - Mm() @ yddot_alpha
+
+    alphatol = 1e-6
+    it = 0
+
+    # store ydot now, return a copy since the code might iterate if the
+    # block iterative approach is used
+    ynew = ydot.copy()
+    while np.linalg.norm(eps) > alphatol:
+        it += 1
+        mat_new = (
+            alpha_mr / Dt / gamma_r * Mm()
+            + alpha_fr * Cm(y_alpha, ydot_alpha)
+            + Dt * beta_r * alpha_fr / gamma_r * Km(y_alpha, ydot_alpha)
+        )
+        delta_v = np.linalg.inv(mat_new) @ eps
+
+        # update step
+        ynew += delta_v
+        y_alpha += Dt * beta_r * alpha_fr / gamma_r * delta_v
+        ydot_alpha += alpha_fr * delta_v
+        yddot_alpha += alpha_mr / Dt / gamma_r * delta_v
+        np.copyto(eps, Fext - restoring_force(y_alpha, ydot_alpha) - Mm() @ yddot_alpha)
+
+    if logs:
+        if MPI.rank(MPI.comm_world) == 0:
+            print(
+                f"Generalized-alpha method: solid subproblem converged in {it} iterations."
+            )
+    return ynew
+
+
 def solid_step_linear(
     alpha_fr, alpha_mr, beta_r, gamma_r, Dt, M, C, K, Fext, y_old, ydot_old, yddot_old
 ):
     """
     advance in time following the generalized alpha method, as written by Peric
-    results in the new value of solid velocity
+    results in the new value of solid velocity. M, C, K are assumed to be
+    constant here
     """
     resd = (
         2 * alpha_mr * M @ (Dt * yddot_old + ydot_old)
@@ -217,7 +295,7 @@ def solid_step_linear(
         * (
             2 * Dt * K @ (Dt * yddot_old + ydot_old) * beta_r
             - gamma_r
-            * (Dt**2 * K @ yddot_old - 2 * C @ ydot_old + 2 * Dt * K @ ydot_old)
+            * (Dt ** 2 * K @ yddot_old - 2 * C @ ydot_old + 2 * Dt * K @ ydot_old)
         )
     )
     mat = 2 * (alpha_mr * M + Dt * alpha_fr * (Dt * beta_r * K + gamma_r * C))
@@ -235,7 +313,7 @@ def solid_corrector(beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old):
     y_new = (
         y_old
         + Dt * (gamma_r - beta_r) / gamma_r * ydot_old
-        + Dt**2 * (gamma_r - 2 * beta_r) / 2 / gamma_r * yddot_old
+        + Dt ** 2 * (gamma_r - 2 * beta_r) / 2 / gamma_r * yddot_old
         + Dt * beta_r / gamma_r * ydot
     )
     yddot_new = -(1 - gamma_r) / gamma_r * yddot_old + 1.0 / Dt / gamma_r * (
