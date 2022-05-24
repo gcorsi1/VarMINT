@@ -347,15 +347,15 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         Fext[0] = 0.0
         if t < 0.5:
             Fext[1] = 0.0
-        ydot_new = solid_step(
+        ydot_new = solid_step_nonlinear(
             alpha_fr,
             alpha_mr,
             beta_r,
             gamma_r,
             Dt,
-            M,
-            C,
-            K,
+            Mm,
+            Cm,
+            Km,
             Fext,
             y_old,
             ydot_old,
