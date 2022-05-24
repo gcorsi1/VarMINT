@@ -1,9 +1,10 @@
 """
-This demo solves the 2D Turek benchmark, using the generalized alpha method 
-of Jansen et al for time integration of the Navier-Stokes equations.  
+This demo solves the 2D flow past a cylinder, and calculates lift and drag 
+coefficients that can be compared with literature, see 
+https://dx.doi.org/10.1016/j.cma.2014.10.040
 """
 from VarMINT import *
-from VarMINTpostproc import calc_force_coeffs
+from VarMINTpostproc import calc_force_coeffs_turek
 import math
 import numpy as np
 from collections import defaultdict
@@ -136,10 +137,11 @@ for ui in (up, upt, upt_old):
 
 
 # Set no-penetration BCs on velocity and pin down pressure in one corner:
+obstacle = 1
 inflow = 2
 outflow = 3
-walls = 4
-obstacle = 5
+bottom = 4
+top = 5
 
 # Define boundary conditions
 U_inlet = BoundaryFunction(0.0)
@@ -151,7 +153,7 @@ bcs = [bc_inlet, bc_walls, bc_obstacle, bc_outlet]
 
 t = 0.0
 results["ts"].append(t)
-calc_force_coeffs(u, p, mu, n, ds(5), results, len_scale=0.1)
+calc_force_coeffs_turek(u, p, mu, n, ds(5), results, len_scale=0.1)
 
 # Time stepping loop:
 with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
@@ -184,7 +186,7 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             filep.write(pf, step)
 
         results["ts"].append(t)
-        calc_force_coeffs(u, p, mu, n, ds(5), results, len_scale=0.1)
+        calc_force_coeffs_turek(u, p, mu, n, ds(5), results, len_scale=0.1)
     np.savez(
         "resultsTUREK",
         CD=np.array(results["c_ds"]),
