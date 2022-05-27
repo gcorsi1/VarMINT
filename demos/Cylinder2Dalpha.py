@@ -3,14 +3,16 @@ This demo solves the 2D flow past a cylinder, and calculates lift and drag
 coefficients that can be compared with literature, see 
 https://dx.doi.org/10.1016/j.cma.2014.10.040
 """
-from VarMINT import *
-import numpy as np
+import argparse
 from collections import defaultdict
 
 import matplotlib
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
+
+from VarMINT import *
 
 matplotlib.use("Agg")
 
@@ -19,7 +21,6 @@ matplotlib.use("Agg")
 # Arguments are parsed from the command line, with some hard-coded defaults
 # here.  See help messages for descriptions of parameters.
 
-import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -109,7 +110,7 @@ class BoundaryFunction(UserExpression):
     # simple linear time ramp
     def eval(self, values, x):
         U = 1.0 * (self.t - self.ramp_end_t) if self.t < self.ramp_end_t else 1.0
-        V = 0.01 if self.t < self.ramp_end_t else 0.0  # small disturbance 
+        V = 0.01 if self.t < self.ramp_end_t else 0.0  # small disturbance
         values[0] = U
         values[1] = V
 
@@ -128,7 +129,7 @@ F = interiorResidual(
     mesh,
     u_t=u_t_alpha,
     Dt=Dt,
-    C_I=Constant(6.0 * (k**4)),
+    C_I=Constant(6.0 * (k ** 4)),
     dx=dx,
 )
 
@@ -195,7 +196,7 @@ F0 = interiorResidual(
     mesh,
     u_t=ut,
     Dt=Dt,
-    C_I=Constant(6.0 * (k**4)),
+    C_I=Constant(6.0 * (k ** 4)),
     dx=dx,
 )
 
@@ -210,7 +211,7 @@ F1 = interiorResidual(
     mesh,
     u_t=ut,
     Dt=Dt,
-    C_I=Constant(6.0 * (k**4)),
+    C_I=Constant(6.0 * (k ** 4)),
     dx=dx,
 )
 
@@ -260,7 +261,7 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         freqs = np.fft.fftfreq(Ntot) * Ntot * dfs
         idx = np.argmax(np.abs(ws))
         maxf = np.abs(freqs[idx])
-        if (MPI.rank(MPI.comm_world) == 0):
+        if MPI.rank(MPI.comm_world) == 0:
             print(f"main frequency sampled from data is: {maxf:.2f}")
         results["freq"].append(maxf)
 
@@ -273,10 +274,17 @@ data_preproc.to_csv("./raw_data.csv")
 
 fade_ = 1  # DOWNSAMPLE FACTOR FOR THE PLOTS
 data_preproc = data_preproc.iloc[1::fade_, :]  # only get some of the rows in the plot
-# for plots, remove initial seconds where pressure wave gives spurious 
+# for plots, remove initial seconds where pressure wave gives spurious
 # very high values
 data_preproc = data_preproc[data_preproc.t > 3]
-g = sns.lineplot( x="t", y="value", hue="variable", hue_order=["CL", "CD"], marker="o", data=pd.melt(data_preproc, ["t"]),)
+g = sns.lineplot(
+    x="t",
+    y="value",
+    hue="variable",
+    hue_order=["CL", "CD"],
+    marker="o",
+    data=pd.melt(data_preproc, ["t"]),
+)
 # g = sns.lineplot(x="t", y="Fy", marker="o", data=data_preproc)
 # g = sns.lineplot(x="t", y="Fx", marker="o", data=data_preproc)
 sns.despine()

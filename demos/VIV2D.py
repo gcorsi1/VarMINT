@@ -2,17 +2,19 @@
 This demo solves the 2D VIV FSI problem introduced in the article of Peric 
 and Dettmer on CMAME (2006).  
 """
+import argparse
+from collections import defaultdict
+
+import numpy as np
+
 from VarMINT import *
 from VarMINTpostproc import integrate_force_strong
-import numpy as np
-from collections import defaultdict
 
 ####### Parameters #######
 
 # Arguments are parsed from the command line, with some hard-coded defaults
 # here.  See help messages for descriptions of parameters.
 
-import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -168,6 +170,8 @@ f_m = inner(Constant((0.0, 0.0)), z) * dx
 N = 2
 y, ydot, yddot = [np.zeros(N) for _ in range(3)]
 y_old, ydot_old, yddot_old = [np.zeros(N) for _ in range(3)]
+ydot_iter, ydot_iter_old = [np.zeros(N) for _ in range(2)]
+residual, residual_old = [np.zeros(N) for _ in range(2)]
 
 # For now, rhoinf is set to be the same as that of the fluid
 rhoinf_r = rhoinf
@@ -175,18 +179,21 @@ alpha_fr = 1.0 / (1.0 + rhoinf_r)
 alpha_mr = (2.0 - rhoinf_r) / (1.0 + rhoinf_r)
 beta_r = 0.25 * (1 + alpha_mr - alpha_fr) ** 2
 gamma_r = 0.5 + alpha_mr - alpha_fr
+m = 117.103
+c = 0.316464
+k = 148.477
 
 
 def Mm():
-    return np.array([[1.0, 0.0], [0.0, 1.0]])
+    return np.array([[m, 0.0], [0.0, m]])
 
 
 def Km(y, ydot):
-    return np.array([[2.15 * 2 * pi, 0.0], [0.0, 2.15 * 2 * pi]])
+    return np.array([[k, 0.0], [0.0, k]])
 
 
 def Cm(y, ydot):
-    return np.array([[0.05, 0.0], [0.0, 0.05]])
+    return np.array([[c, 0.0], [0.0, c]])
 
 
 def restoring_force(K, C, disp, velocity):
@@ -322,8 +329,45 @@ def solid_corrector(beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old):
     return y_new, yddot_new
 
 
+def fsi_postprocessing(
+    ydot_iter,
+    ydot_iter_old,
+    ydot_old,
+    fsi_resd,
+    residual,
+    iter_fsi,
+    residual_old,
+    omega_old,
+):
+    """
+    Calculate the normalized residual for the fsi iteration, and relax the
+    iteration result with the Aitken acceleration method
+    """
+    print("YDOT ITER, YDOT ITER OLD", ydot_iter, ydot_iter_old)
+    np.copyto(residual_old, residual)
+    residual_new = ydot_iter - ydot_iter_old
+    print("RESIDUAL, RESIDUAL OLD", residual_new, residual_old)
+    res_ = np.linalg.norm(residual_new) / (np.linalg.norm(ydot_old) + 1.0e-8)
+    print(f"RESIDUAL NORM IS {res_}")
+    np.copyto(fsi_resd, res_)
+    np.copyto(residual, residual_new)
+    omega_new = (
+        -1.0
+        * omega_old[0]
+        * np.dot(residual_old, (residual - residual_old))
+        / (np.linalg.norm(residual - residual_old) ** 2 + 1.0e-24)
+    )
+    print(f"OMEGA NEW VALUE RAW: {omega_new}")
+    omega_new = max(min(omega_new, 0.95), 0.2)
+    ydot_new_post = omega_new * ydot_iter + (1.0 - omega_new) * ydot_iter_old
+    print(f"ITER: {iter_fsi}. OMEGA VALUE: {omega_new}. SOLID VELOCITY IS: {ydot}")
+    return ydot_new_post, omega_new
+
+
 t = 0.0
 results["ts"].append(t)
+max_iter_fsi = 50
+fsi_tol = 1e-4
 
 # Time stepping loop:
 with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
@@ -353,41 +397,68 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         # Move mesh
         ALE.move(mesh, Sm)
 
-        Fext = -1.0 * integrate_force_strong(u, p, mu, mesh, ds, 1)
-        Fext[0] = 0.0
-        if t < 0.5:
-            Fext[1] = 0.0
-        ydot_new = solid_step_nonlinear(
-            alpha_fr,
-            alpha_mr,
-            beta_r,
-            gamma_r,
-            Dt,
-            Mm,
-            Cm,
-            Km,
-            Fext,
-            y_old,
-            ydot_old,
-            yddot_old,
-            logs=True,
-        )
-        np.copyto(y_old, y)
-        np.copyto(ydot_old, ydot)
-        np.copyto(yddot_old, yddot)
-        np.copyto(ydot, ydot_new)
-        # Update mesh velocity for next time-step
-        vte_y.Uy = ydot[1]
+        iter_fsi = 0
+        fsi_resd = np.array([1e8])
+        omega_old = np.array([0.2])
 
-        # Now advance fluid in time
         # Update dirichlet boundary condition:
         vbc.t = t
-        _, ydot_alpha, _ = solid_alpha(
-            alpha_fr, alpha_mr, beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old
-        )
-        bc_obstacle = DirichletBC(V.sub(0), ydot_alpha, boundaries, ball)
-        solve(F == 0, up, bcs=bcs + [bc_obstacle])
 
+        while iter_fsi < max_iter_fsi and fsi_resd[0] < fsi_tol:
+            Fext = -1.0 * integrate_force_strong(u, p, mu, mesh, ds, 1)
+            Fext[0] = 0.0
+            if t < 0.5:
+                Fext[1] = 0.0
+            ydot_new = solid_step_nonlinear(
+                alpha_fr,
+                alpha_mr,
+                beta_r,
+                gamma_r,
+                Dt,
+                Mm,
+                Cm,
+                Km,
+                Fext,
+                y_old,
+                ydot_old,
+                yddot_old,
+                logs=True,
+            )
+            np.copyto(ydot_iter_old, ydot_iter)
+            np.copyto(ydot_iter, ydot_new)
+
+            ydot_new_post, omega_new = fsi_postprocessing(
+                ydot_iter,
+                ydot_iter_old,
+                ydot_old,
+                fsi_resd,
+                residual,
+                iter_fsi,
+                residual_old,
+                omega_old,
+            )
+
+            np.copyto(ydot, ydot_new_post)
+            np.copyto(omega_old, np.array([omega_new]))
+
+            # Now advance fluid in time
+            _, ydot_alpha, _ = solid_alpha(
+                alpha_fr,
+                alpha_mr,
+                beta_r,
+                gamma_r,
+                Dt,
+                ydot,
+                y_old,
+                ydot_old,
+                yddot_old,
+            )
+            bc_obstacle = DirichletBC(V.sub(0), ydot_alpha, boundaries, ball)
+            solve(F == 0, up, bcs=bcs + [bc_obstacle])
+
+            iter_fsi += 1
+
+        print(f"Converged in {iter_fsi} FSI iterations.")
         # Corrector step for fluid
         upt.assign(
             1.0 / float(Dt) / gamma_f * (up - up_old)
@@ -399,9 +470,14 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         y_new, yddot_new = solid_corrector(
             beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old
         )
-        np.copyto(y, y_new)
-        np.copyto(yddot, yddot_new)
+        np.copyto(y_old, y_new)
+        np.copyto(ydot_old, ydot)
+        np.copyto(yddot_old, yddot_new)
 
+        # Update mesh velocity for next time-step
+        vte_y.Uy = ydot[1]
+
+        # Save some results
         uf, pf = up.split(deepcopy=True)
         uf.rename("Velocity", "Velocity")
         pf.rename("Pressure", "Pressure")
