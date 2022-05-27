@@ -4,8 +4,6 @@ coefficients that can be compared with literature, see
 https://dx.doi.org/10.1016/j.cma.2014.10.040
 """
 from VarMINT import *
-from VarMINTpostproc import calc_force_coeffs_turek
-import math
 import numpy as np
 from collections import defaultdict
 

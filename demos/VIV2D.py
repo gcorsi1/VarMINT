@@ -3,7 +3,7 @@ This demo solves the 2D VIV FSI problem introduced in the article of Peric
 and Dettmer on CMAME (2006).  
 """
 from VarMINT import *
-from VarMINTpostproc import integrate_force
+from VarMINTpostproc import integrate_force_strong
 import numpy as np
 from collections import defaultdict
 
@@ -96,7 +96,7 @@ u_t_alpha = (1.0 - alpha_mf / gamma_f) * ut_old + alpha_mf / Dt / gamma_f * (u -
 x = SpatialCoordinate(mesh)
 u_IC = as_vector((Constant(0.0), Constant(0.0)))
 vbc = Expression(
-    ("t < 4.0 ? U*(1-std::cos(3.14142/2.0*t))/2.0 : U", "0.0"), U=1.0, t=0.0, degree=2
+    ("t < 2.0 ? U*(1-std::cos(3.14142/2.0*t))/2.0 : U", "0.0"), U=1.0, t=0.0, degree=2
 )  # ------INLET WITH STARTUP PROFILE
 
 # Project the initial condition:
@@ -113,7 +113,7 @@ z = TestFunction(VM)
 Sm = Function(VM)
 v_mesh = Function(VM)
 v_mesh_old = Function(VM)
-# rigid velocity expression
+# Rigid velocity expression
 vte_x = Expression("Ux - omega_z*x[1]", Ux=0.0, omega_y=0.0, omega_z=0.0, degree=2)
 vte_y = Expression("Uy + omega_z*x[0]", Uy=0.0, omega_x=0.0, omega_z=0.0, degree=2)
 v_mesh_exp = as_vector((vte_x, vte_y))
@@ -164,12 +164,12 @@ F = interiorResidual(
 a_m = inner(grad(s), grad(z)) * dx
 f_m = inner(Constant((0.0, 0.0)), z) * dx
 
-# SOLID PROBLEM
+# Solid problem
 N = 2
 y, ydot, yddot = [np.zeros(N) for _ in range(3)]
 y_old, ydot_old, yddot_old = [np.zeros(N) for _ in range(3)]
 
-# for now, rhoinf is set to be the same as that of the fluid
+# For now, rhoinf is set to be the same as that of the fluid
 rhoinf_r = rhoinf
 alpha_fr = 1.0 / (1.0 + rhoinf_r)
 alpha_mr = (2.0 - rhoinf_r) / (1.0 + rhoinf_r)
@@ -181,16 +181,16 @@ def Mm():
     return np.array([[1.0, 0.0], [0.0, 1.0]])
 
 
-def Km():
-    return np.array([[0.215 * 2 * pi, 0.0], [0.0, 0.215 * 2 * pi]])
+def Km(y, ydot):
+    return np.array([[2.15 * 2 * pi, 0.0], [0.0, 2.15 * 2 * pi]])
 
 
-def Cm():
-    return np.array([[0.01, 0.0], [0.0, 0.01]])
+def Cm(y, ydot):
+    return np.array([[0.05, 0.0], [0.0, 0.05]])
 
 
-def restoring_force(disp, velocity):
-    return Cm() @ velocity + Km() @ disp
+def restoring_force(K, C, disp, velocity):
+    return C @ velocity + K @ disp
 
 
 def solid_alpha(
@@ -223,7 +223,6 @@ def solid_step_nonlinear(
     Cm,
     Km,
     Fext,
-    ydot,
     y_old,
     ydot_old,
     yddot_old,
@@ -235,41 +234,42 @@ def solid_step_nonlinear(
     the solid ODE has a nonlinear component, depending on velocity and
     displacements (linear in the accelerations)
     """
-    # predictor step
-    y_alpha = (
-        y_old
-        + Dt * alpha_fr * (gamma_r - beta_r) / gamma_r * ydot_old
-        + Dt ** 2 * alpha_fr * (gamma_r - 2 * beta_r) / 2.0 / gamma_r * yddot_old
-        + Dt * alpha_fr * beta_r / gamma_r * ydot
+    # Predictor step, notice ydot_old appears twice, here we simply start from
+    # the known value at old time step
+    y_alpha, ydot_alpha, yddot_alpha = solid_alpha(
+        alpha_fr, alpha_mr, beta_r, gamma_r, Dt, ydot_old, y_old, ydot_old, yddot_old
     )
-    ydot_alpha = (1 - alpha_fr) * ydot_old + alpha_fr * ydot
-    yddot_alpha = (1.0 - alpha_mr) / gamma_r * yddot_old + alpha_mr / Dt / gamma_r * (
-        ydot - ydot_old
-    )
-    # residual of the nonlinear ODE
-    eps = Fext - restoring_force(y_alpha, ydot_alpha) - Mm() @ yddot_alpha
+    # Residual of the nonlinear ODE
+    MM = Mm()
+    KM = Km(y_alpha, ydot_alpha)
+    CM = Cm(y_alpha, ydot_alpha)
+    eps = Fext - restoring_force(KM, CM, y_alpha, ydot_alpha) - MM @ yddot_alpha
 
     alphatol = 1e-6
     it = 0
 
-    # store ydot now, return a copy since the code might iterate if the
+    # Store ydot now, return a copy since the code might iterate if the
     # block iterative approach is used
-    ynew = ydot.copy()
+    ynew = ydot_old.copy()
     while np.linalg.norm(eps) > alphatol:
         it += 1
+        KM = Km(y_alpha, ydot_alpha)
+        CM = Cm(y_alpha, ydot_alpha)
         mat_new = (
-            alpha_mr / Dt / gamma_r * Mm()
-            + alpha_fr * Cm(y_alpha, ydot_alpha)
-            + Dt * beta_r * alpha_fr / gamma_r * Km(y_alpha, ydot_alpha)
+            alpha_mr / Dt / gamma_r * MM
+            + alpha_fr * CM
+            + Dt * beta_r * alpha_fr / gamma_r * KM
         )
         delta_v = np.linalg.inv(mat_new) @ eps
 
-        # update step
+        # Update step
         ynew += delta_v
         y_alpha += Dt * beta_r * alpha_fr / gamma_r * delta_v
         ydot_alpha += alpha_fr * delta_v
         yddot_alpha += alpha_mr / Dt / gamma_r * delta_v
-        np.copyto(eps, Fext - restoring_force(y_alpha, ydot_alpha) - Mm() @ yddot_alpha)
+        np.copyto(
+            eps, Fext - restoring_force(KM, CM, y_alpha, ydot_alpha) - MM @ yddot_alpha
+        )
 
     if logs:
         if MPI.rank(MPI.comm_world) == 0:
@@ -283,7 +283,7 @@ def solid_step_linear(
     alpha_fr, alpha_mr, beta_r, gamma_r, Dt, M, C, K, Fext, y_old, ydot_old, yddot_old
 ):
     """
-    advance in time following the generalized alpha method, as written by Peric
+    Advance in time following the generalized alpha method, as written by Peric
     results in the new value of solid velocity. M, C, K are assumed to be
     constant here
     """
@@ -301,13 +301,13 @@ def solid_step_linear(
     mat = 2 * (alpha_mr * M + Dt * alpha_fr * (Dt * beta_r * K + gamma_r * C))
     invmat = 1.0 / mat if len(mat.shape) == 1 else np.linalg.inv(mat)
     ydot_new = invmat @ resd
-    # recast to np.array if needed (ie if the ode is 1d and result is a float)
+    # Recast to np.array if needed (ie if the ode is 1d and result is a float)
     return np.array(ydot_new)
 
 
 def solid_corrector(beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old):
     """
-    given value of solid velocity at new time, calculate the acceleration and
+    Given value of solid velocity at new time, calculate the acceleration and
     displacement
     """
     y_new = (
@@ -340,10 +340,20 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         t += float(Dt)
         print("======= Time step " + str(step + 1) + "/" + str(N_STEPS) + " =======")
 
-        np.copyto(y_old, y)
-        np.copyto(ydot_old, ydot)
-        np.copyto(yddot_old, yddot)
-        Fext = -1.0 * integrate_force(u, p, mu, mesh, ds, 1)
+        # Lift mesh velocity at interface
+        bc_m_obstacle = DirichletBC(VM, v_mesh_exp, boundaries, ball)
+        v_mesh_old.vector().zero()
+        v_mesh_old.vector().axpy(1.0, v_mesh.vector())
+        solve(a_m == f_m, v_mesh, bcs=bcs_m + [bc_m_obstacle])
+        print("CALLING ALE MOVE.")
+        Sm.vector().zero()
+        # Trapezoidal rule
+        Sm.vector().axpy(Dt / 2.0, v_mesh.vector())
+        Sm.vector().axpy(Dt / 2.0, v_mesh_old.vector())
+        # Move mesh
+        ALE.move(mesh, Sm)
+
+        Fext = -1.0 * integrate_force_strong(u, p, mu, mesh, ds, 1)
         Fext[0] = 0.0
         if t < 0.5:
             Fext[1] = 0.0
@@ -360,36 +370,32 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             y_old,
             ydot_old,
             yddot_old,
+            logs=True,
         )
+        np.copyto(y_old, y)
+        np.copyto(ydot_old, ydot)
+        np.copyto(yddot_old, yddot)
         np.copyto(ydot, ydot_new)
+        # Update mesh velocity for next time-step
         vte_y.Uy = ydot[1]
-        bc_m_obstacle = DirichletBC(VM, v_mesh_exp, boundaries, ball)
-
-        # lift velocity at interface
-        # Am, Lm = assemble_system(a_m, f_m, bcs_m)
-        v_mesh_old.vector().zero()
-        v_mesh_old.vector().axpy(1.0, v_mesh.vector())
-        solve(a_m == f_m, v_mesh, bcs=bcs_m + [bc_m_obstacle])
-        print("CALLING ALE MOVE.")
-        Sm.vector().zero()
-        # Trapezoidal rule
-        Sm.vector().axpy(Dt / 2.0, v_mesh.vector())
-        Sm.vector().axpy(Dt / 2.0, v_mesh_old.vector())
-        # Move mesh
-        ALE.move(mesh, Sm)
 
         # Now advance fluid in time
         # Update dirichlet boundary condition:
         vbc.t = t
-        bc_obstacle = DirichletBC(V.sub(0), v_mesh, boundaries, ball)
-
+        _, ydot_alpha, _ = solid_alpha(
+            alpha_fr, alpha_mr, beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old
+        )
+        bc_obstacle = DirichletBC(V.sub(0), ydot_alpha, boundaries, ball)
         solve(F == 0, up, bcs=bcs + [bc_obstacle])
-        # Corrector step
+
+        # Corrector step for fluid
         upt.assign(
             1.0 / float(Dt) / gamma_f * (up - up_old)
             - (1.0 - gamma_f) / gamma_f * upt_old
         )
         up_old.assign(up)
+        upt_old.assign(upt)
+        # Corrector step for solid
         y_new, yddot_new = solid_corrector(
             beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old
         )
