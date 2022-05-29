@@ -5,10 +5,16 @@ and Dettmer on CMAME (2006).
 import argparse
 from collections import defaultdict
 
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import seaborn as sns
 
 from VarMINT import *
 from VarMINTpostproc import integrate_force_strong
+
+matplotlib.use("Agg")
 
 ####### Parameters #######
 
@@ -97,9 +103,11 @@ u_t_alpha = (1.0 - alpha_mf / gamma_f) * ut_old + alpha_mf / Dt / gamma_f * (u -
 # Initial condition for the Taylor--Green vortex
 x = SpatialCoordinate(mesh)
 u_IC = as_vector((Constant(0.0), Constant(0.0)))
+# Always use U value of 1.0 at infinity, adjust viscosity to get the required
+# Reynolds number
 vbc = Expression(
     ("t < 2.0 ? U*(1-std::cos(3.14142/2.0*t))/2.0 : U", "0.0"), U=1.0, t=0.0, degree=2
-)  # ------INLET WITH STARTUP PROFILE
+)  # Inlet with startup profile
 
 # Project the initial condition:
 up_old.assign(project(as_vector((u_IC[0], u_IC[1], Constant(0.0))), V))
@@ -358,14 +366,15 @@ def fsi_postprocessing(
         / (np.linalg.norm(residual - residual_old) ** 2 + 1.0e-24)
     )
     print(f"OMEGA NEW VALUE RAW: {omega_new}")
-    omega_new = max(min(omega_new, 0.95), 0.2)
+    omega_new = max(min(omega_new, 0.95), 0.5)
     ydot_new_post = omega_new * ydot_iter + (1.0 - omega_new) * ydot_iter_old
     print(f"ITER: {iter_fsi}. OMEGA VALUE: {omega_new}. SOLID VELOCITY IS: {ydot}")
-    return ydot_new_post, omega_new
+    return ydot_new_post, np.array(omega_new)
 
 
 t = 0.0
 results["ts"].append(t)
+results["disp_y"].append(0.0)
 max_iter_fsi = 50
 fsi_tol = 1e-4
 
@@ -404,10 +413,11 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         # Update dirichlet boundary condition:
         vbc.t = t
 
-        while iter_fsi < max_iter_fsi and fsi_resd[0] < fsi_tol:
+        while iter_fsi < max_iter_fsi and fsi_resd[0] > fsi_tol:
             Fext = -1.0 * integrate_force_strong(u, p, mu, mesh, ds, 1)
             Fext[0] = 0.0
-            if t < 0.5:
+            # Wait for wake to develop
+            if t < 2.5:
                 Fext[1] = 0.0
             ydot_new = solid_step_nonlinear(
                 alpha_fr,
@@ -439,7 +449,7 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             )
 
             np.copyto(ydot, ydot_new_post)
-            np.copyto(omega_old, np.array([omega_new]))
+            np.copyto(omega_old, omega_new)
 
             # Now advance fluid in time
             _, ydot_alpha, _ = solid_alpha(
@@ -485,6 +495,37 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         filep.write(pf, step)
 
         results["ts"].append(t)
-        results["disp_y"].append(y[1])
+        results["disp_y"].append(y_old[1])
 
 print("End of time loop.")
+
+# End run postprocessing
+data_preproc = pd.DataFrame.from_dict(results)
+data_preproc.to_csv("./raw_data.csv")
+
+fade_ = 2  # DOWNSAMPLE FACTOR FOR THE PLOTS
+data_preproc = data_preproc.iloc[1::fade_, :]  # only get some of the rows in the plot
+# For plots, might remove initial seconds where pressure wave gives spurious
+# very high values
+# data_preproc = data_preproc[data_preproc.t > 3]
+# g = sns.lineplot(
+#     x="t",
+#     y="value",
+#     hue="variable",
+#     hue_order=["CL", "CD"],
+#     marker="o",
+#     data=pd.melt(data_preproc, ["t"]),
+# )
+g = sns.lineplot(x="ts", y="disp_y", marker="o", data=data_preproc)
+# g = sns.lineplot(x="t", y="Fx", marker="o", data=data_preproc)
+sns.despine()
+plt.xlabel(r"$t [s]$")
+plt.ylabel(r"$y/D$")
+plt.legend(
+    title="Coefficient",
+    bbox_to_anchor=(0.9, 0.9),
+    loc=2,
+    labels=[r"$C_L$", r"$C_D$"],
+)
+plt.savefig("./coefficients.pdf")
+plt.close()
