@@ -118,6 +118,7 @@ for ui in (up, upt, upt_old):
 
 # Mesh motion stuff
 VM = V.sub(0).collapse()
+QM = V.sub(1).collapse()
 s = TrialFunction(VM)
 z = TestFunction(VM)
 Sm = Function(VM)
@@ -372,9 +373,61 @@ def fsi_postprocessing(
     return ydot_new_post, np.array(omega_new)
 
 
+# define the functions that will be used to integrate the forces on the
+# cylinder variationally, these will be equal to a cartesian base vector on
+# the surface of the cylinder, and 0 on the other Dirichlet boundaries.
+# Most of the stuff needed was already defined when writing down the mesh
+# motion problem
+bc_m_obstacle_e0 = DirichletBC(VM, Constant((1.0, 0.0)), boundaries, ball)
+bc_m_obstacle_e1 = DirichletBC(VM, Constant((0.0, 1.0)), boundaries, ball)
+bcs_f = [bc_m_inlet, bc_m_bottom, bc_m_top]
+eis = [Function(VM) for _ in range(mesh.geometry().dim())]
+
+# solve an auxiliary laplacian problem in order to calculate the e_i
+# and define a zero function to be used for the pressure test function
+for eii, bci in zip(eis, [bc_m_obstacle_e0, bc_m_obstacle_e1]):
+    solve(a_m == f_m, eii, bcs=bcs_f + [bci])
+q0 = Function(QM)
+q0.assign(project(Constant(0.0), QM))
+
+# Calculate force variationally
+F0 = interiorResidual(
+    u,
+    p,
+    eis[0],
+    q0,
+    rho,
+    mu,
+    mesh,
+    u_t=ut,
+    Dt=Dt,
+    C_I=Constant(6.0 * (k ** 4)),
+    dx=dx,
+    u_mesh=v_mesh,
+)
+
+# Calculate force variationally
+F1 = interiorResidual(
+    u,
+    p,
+    eis[1],
+    q0,
+    rho,
+    mu,
+    mesh,
+    u_t=ut,
+    Dt=Dt,
+    C_I=Constant(6.0 * (k ** 4)),
+    dx=dx,
+    u_mesh=v_mesh,
+)
+
+
 t = 0.0
 results["ts"].append(t)
 results["disp_y"].append(0.0)
+results["CD"].append(2.0 * assemble(F0))
+results["CL"].append(2.0 * assemble(F1))
 max_iter_fsi = 50
 fsi_tol = 1e-4
 
@@ -416,9 +469,13 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         while iter_fsi < max_iter_fsi and fsi_resd[0] > fsi_tol:
             Fext = -1.0 * integrate_force_strong(u, p, mu, mesh, ds, 1)
             Fext[0] = 0.0
+            # Actually use the variational calculation
+            fx0, fx1 = assemble(F0), assemble(F1)
             # Wait for wake to develop
             if t < 2.5:
                 Fext[1] = 0.0
+            else:
+                Fext[1] = fx1
             ydot_new = solid_step_nonlinear(
                 alpha_fr,
                 alpha_mr,
@@ -491,11 +548,14 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         uf, pf = up.split(deepcopy=True)
         uf.rename("Velocity", "Velocity")
         pf.rename("Pressure", "Pressure")
-        fileu.write(uf, step)
-        filep.write(pf, step)
+        if not step % 100:
+            fileu.write(uf, step)
+            filep.write(pf, step)
 
         results["ts"].append(t)
         results["disp_y"].append(y_old[1])
+        results["CD"].append(2.0 * assemble(F0))
+        results["CL"].append(2.0 * assemble(F1))
 
 print("End of time loop.")
 
@@ -503,7 +563,7 @@ print("End of time loop.")
 data_preproc = pd.DataFrame.from_dict(results)
 data_preproc.to_csv("./raw_data.csv")
 
-fade_ = 2  # DOWNSAMPLE FACTOR FOR THE PLOTS
+fade_ = 4  # DOWNSAMPLE FACTOR FOR THE PLOTS
 data_preproc = data_preproc.iloc[1::fade_, :]  # only get some of the rows in the plot
 # For plots, might remove initial seconds where pressure wave gives spurious
 # very high values
