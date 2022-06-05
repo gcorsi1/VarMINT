@@ -505,6 +505,7 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
                 omega_old,
             )
 
+            np.copyto(ydot_iter, ydot_new_post)
             np.copyto(ydot, ydot_new_post)
             np.copyto(omega_old, omega_new)
 
