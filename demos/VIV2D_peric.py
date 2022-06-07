@@ -16,6 +16,9 @@ from VarMINTpostproc import integrate_force_strong
 
 matplotlib.use("Agg")
 
+# Suppress excessive output in parallel:
+parameters["std_out_all_processes"] = False
+
 ####### Parameters #######
 
 # Arguments are parsed from the command line, with some hard-coded defaults
@@ -45,6 +48,7 @@ Re = Constant(float(args.Re))
 k = int(args.k)
 T = float(args.T)
 rhoinf = float(args.rhoinf)
+D = 1.6e-3
 
 # store results
 results = defaultdict(list)
@@ -56,7 +60,7 @@ dx = dx(metadata={"quadrature_degree": QUAD_DEG})
 
 # Domain:
 mesh = Mesh(MPI.comm_world)
-with XDMFFile("bfile_VIV.xdmf") as file:
+with XDMFFile("bfile_VIV_peric.xdmf") as file:
     file.read(mesh)
 
 mtot_ = MPI.sum(MPI.comm_world, mesh.num_cells())
@@ -64,7 +68,7 @@ print(f"Read mesh with {mtot_} cells.")
 
 # Read boundary data
 mvc_boundaries = MeshValueCollection("size_t", mesh, mesh.topology().dim() - 1)
-with XDMFFile("domains_VIV.xdmf") as file:
+with XDMFFile("domains_VIV_peric.xdmf") as file:
     file.read(mvc_boundaries)
 boundaries = cpp.mesh.MeshFunctionSizet(mesh, mvc_boundaries)
 ds = Measure("ds", domain=mesh, subdomain_data=boundaries)
@@ -81,7 +85,8 @@ v, q = split(vq)
 
 # Determine physical parameters from Reynolds number:
 rho = Constant(1.0)
-mu = Constant(1.0 / Re)
+mu = Constant(1.0 / 1.0e6)
+Uinf = Constant(mu * Re / D)
 nu = mu / rho
 
 # Constants of the genralized alpha method
@@ -106,7 +111,7 @@ u_IC = as_vector((Constant(0.0), Constant(0.0)))
 # Always use U value of 1.0 at infinity, adjust viscosity to get the required
 # Reynolds number
 vbc = Expression(
-    ("t < 2.0 ? U*(1-std::cos(3.14142/2.0*t))/2.0 : U", "0.0"), U=1.0, t=0.0, degree=2
+    ("t < 2.0 ? U*(1-std::cos(3.14142/2.0*t))/2.0 : U", "0.0"), U=Uinf, t=0.0, degree=2
 )  # Inlet with startup profile
 
 # Project the initial condition:
@@ -122,8 +127,10 @@ QM = V.sub(1).collapse()
 s = TrialFunction(VM)
 z = TestFunction(VM)
 Sm = Function(VM)
+Sm0 = Function(VM)
 v_mesh = Function(VM)
 v_mesh_old = Function(VM)
+v_mesh_alpha = Function(VM)
 # Rigid velocity expression
 vte_x = Expression("Ux - omega_z*x[1]", Ux=0.0, omega_y=0.0, omega_z=0.0, degree=2)
 vte_y = Expression("Uy + omega_z*x[0]", Uy=0.0, omega_x=0.0, omega_z=0.0, degree=2)
@@ -169,7 +176,7 @@ F = interiorResidual(
     Dt=Dt,
     C_I=Constant(6.0 * (k ** 4)),
     dx=dx,
-    u_mesh=v_mesh,
+    u_mesh=v_mesh_alpha,
 )
 
 a_m = inner(grad(s), grad(z)) * dx
@@ -188,9 +195,9 @@ alpha_fr = 1.0 / (1.0 + rhoinf_r)
 alpha_mr = (2.0 - rhoinf_r) / (1.0 + rhoinf_r)
 beta_r = 0.25 * (1 + alpha_mr - alpha_fr) ** 2
 gamma_r = 0.5 + alpha_mr - alpha_fr
-m = 117.103
-c = 0.316464
-k = 148.477
+k = 5.79  # [N/m]
+c = 3.25e-4  # [Kg/s]
+m = 2.979e-3  # [Kg]
 
 
 def Mm():
@@ -261,7 +268,7 @@ def solid_step_nonlinear(
     CM = Cm(y_alpha, ydot_alpha)
     eps = Fext - restoring_force(KM, CM, y_alpha, ydot_alpha) - MM @ yddot_alpha
 
-    alphatol = 1e-6
+    alphatol = 1e-15
     it = 0
 
     # Store ydot now, return a copy since the code might iterate if the
@@ -290,7 +297,8 @@ def solid_step_nonlinear(
     if logs:
         if MPI.rank(MPI.comm_world) == 0:
             print(
-                f"Generalized-alpha method: solid subproblem converged in {it} iterations."
+                f"Generalized-alpha method: solid subproblem converged in {it} iterations. "
+                f"Norm of residual {np.linalg.norm(eps)}."
             )
     return ynew
 
@@ -367,7 +375,7 @@ def fsi_postprocessing(
         / (np.linalg.norm(residual - residual_old) ** 2 + 1.0e-24)
     )
     print(f"OMEGA NEW VALUE RAW: {omega_new}")
-    omega_new = max(min(omega_new, 0.95), 0.5)
+    omega_new = max(min(omega_new, 0.99), 0.9)
     ydot_new_post = omega_new * ydot_iter + (1.0 - omega_new) * ydot_iter_old
     print(f"ITER: {iter_fsi}. OMEGA VALUE: {omega_new}. SOLID VELOCITY IS: {ydot}")
     return ydot_new_post, np.array(omega_new)
@@ -403,7 +411,7 @@ F0 = interiorResidual(
     Dt=Dt,
     C_I=Constant(6.0 * (k ** 4)),
     dx=dx,
-    u_mesh=v_mesh,
+    u_mesh=v_mesh_alpha,
 )
 
 # Calculate force variationally
@@ -419,15 +427,15 @@ F1 = interiorResidual(
     Dt=Dt,
     C_I=Constant(6.0 * (k ** 4)),
     dx=dx,
-    u_mesh=v_mesh,
+    u_mesh=v_mesh_alpha,
 )
 
 
 t = 0.0
 results["ts"].append(t)
 results["disp_y"].append(0.0)
-results["CD"].append(2.0 * assemble(F0))
-results["CL"].append(2.0 * assemble(F1))
+results["CD"].append(-2.0 * assemble(F0))
+results["CL"].append(-2.0 * assemble(F1))
 results["freq"].append(0.0)
 max_iter_fsi = 50
 fsi_tol = 1e-4
@@ -446,37 +454,37 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
     for step in range(0, N_STEPS):
         t += float(Dt)
         print("======= Time step " + str(step + 1) + "/" + str(N_STEPS) + " =======")
-
-        # Lift mesh velocity at interface
-        bc_m_obstacle = DirichletBC(VM, v_mesh_exp, boundaries, ball)
-        v_mesh_old.vector().zero()
-        v_mesh_old.vector().axpy(1.0, v_mesh.vector())
-        solve(a_m == f_m, v_mesh, bcs=bcs_m + [bc_m_obstacle])
-        print("CALLING ALE MOVE.")
-        Sm.vector().zero()
-        # Trapezoidal rule
-        Sm.vector().axpy(Dt / 2.0, v_mesh.vector())
-        Sm.vector().axpy(Dt / 2.0, v_mesh_old.vector())
-        # Move mesh
-        ALE.move(mesh, Sm)
-
         iter_fsi = 0
         fsi_resd = np.array([1e8])
-        omega_old = np.array([0.2])
+        omega_old = np.array([0.9])
 
         # Update dirichlet boundary condition:
         vbc.t = t
+            
+        # Mesh velocity and motion predictor 
+        bc_m_obstacle = DirichletBC(VM, v_mesh_exp, boundaries, ball)
+        v_mesh_old.vector().zero()
+        v_mesh_old.vector().axpy(1.0, v_mesh.vector())
+        solve(a_m == f_m, v_mesh_old, bcs=bcs_m + [bc_m_obstacle])
+        v_mesh_alpha.vector().zero()
+        v_mesh_alpha.vector().axpy(1.0, v_mesh_old.vector())
+        Sm0.vector().zero()
+        Sm0.vector().axpy(alpha_ff*Dt, v_mesh_old.vector())
+        print("CALLING ALE MOVE.")
+        ALE.move(mesh, Sm0)
 
         while iter_fsi < max_iter_fsi and fsi_resd[0] > fsi_tol:
+
             Fext = -1.0 * integrate_force_strong(u, p, mu, mesh, ds, 1)
-            Fext[0] = 0.0
             # Actually use the variational calculation
             fx0, fx1 = assemble(F0), assemble(F1)
+            print(f"{fx0=}, {fx1=}, {Fext=}")
+            Fext[0] = 0.0
             # Wait for wake to develop
             if t < 2.5:
                 Fext[1] = 0.0
             else:
-                Fext[1] = fx1
+                Fext[1] = -1.0 * fx1
             ydot_new = solid_step_nonlinear(
                 alpha_fr,
                 alpha_mr,
@@ -508,6 +516,8 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
 
             np.copyto(ydot_iter, ydot_new_post)
             np.copyto(ydot, ydot_new_post)
+            # Update mesh velocity for next time-step
+            vte_y.Uy = ydot[1]
             np.copyto(omega_old, omega_new)
 
             # Now advance fluid in time
@@ -524,6 +534,21 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             )
             bc_obstacle = DirichletBC(V.sub(0), ydot_alpha, boundaries, ball)
             solve(F == 0, up, bcs=bcs + [bc_obstacle])
+
+            # Lift mesh velocity at interface
+            bc_m_obstacle = DirichletBC(VM, v_mesh_exp, boundaries, ball)
+            solve(a_m == f_m, v_mesh, bcs=bcs_m + [bc_m_obstacle])
+            v_mesh_alpha.vector().zero()
+            v_mesh_alpha.vector().axpy(1.0-alpha_ff, v_mesh_old.vector())
+            v_mesh_alpha.vector().axpy(alpha_ff, v_mesh.vector())
+            Sm.vector().zero()
+            Sm.vector().axpy(alpha_ff*Dt*gamma_f, v_mesh.vector())
+            Sm.vector().axpy(alpha_ff*Dt*(1.0-gamma_f), v_mesh_old.vector())
+            Sm.vector().axpy(-1.0, Sm0.vector())
+            print("CALLING ALE MOVE.")
+            ALE.move(mesh, Sm)
+            Sm0.vector().zero()
+            Sm0.vector().axpy(1.0, Sm.vector())
 
             iter_fsi += 1
 
@@ -543,9 +568,6 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         np.copyto(ydot_old, ydot)
         np.copyto(yddot_old, yddot_new)
 
-        # Update mesh velocity for next time-step
-        vte_y.Uy = ydot[1]
-
         # Save some results
         uf, pf = up.split(deepcopy=True)
         uf.rename("Velocity", "Velocity")
@@ -556,8 +578,8 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
 
         results["ts"].append(t)
         results["disp_y"].append(y_old[1])
-        results["CD"].append(2.0 * assemble(F0))
-        results["CL"].append(2.0 * assemble(F1))
+        results["CD"].append(-2.0 * assemble(F0))
+        results["CL"].append(-2.0 * assemble(F1))
 
         # calculate the main frequency of oscillation
         Ntot = len(results["CL"])
@@ -576,22 +598,21 @@ print("End of time loop.")
 # End run postprocessing
 data_preproc = pd.DataFrame.from_dict(results)
 data_preproc.to_csv("./raw_data.csv")
+data_preproc["disp_y"] = data_preproc["disp_y"].div(D)
 
 fade_ = 4  # DOWNSAMPLE FACTOR FOR THE PLOTS
 data_preproc = data_preproc.iloc[1::fade_, :]  # only get some of the rows in the plot
 # For plots, might remove initial seconds where pressure wave gives spurious
 # very high values
-# data_preproc = data_preproc[data_preproc.t > 3]
-# g = sns.lineplot(
-#     x="t",
-#     y="value",
-#     hue="variable",
-#     hue_order=["CL", "CD"],
-#     marker="o",
-#     data=pd.melt(data_preproc, ["t"]),
-# )
-g = sns.lineplot(x="ts", y="disp_y", marker="o", data=data_preproc)
-# g = sns.lineplot(x="t", y="Fx", marker="o", data=data_preproc)
+data_preproc = data_preproc[data_preproc.ts > 2]
+g = sns.lineplot(
+    x="ts",
+    y="value",
+    hue="variable",
+    hue_order=["CL", "CD"],
+    marker="o",
+    data=pd.melt(data_preproc, ["ts"]),
+)
 sns.despine()
 plt.xlabel(r"$t [s]$")
 plt.ylabel(r"$y/D$")
@@ -603,3 +624,12 @@ plt.legend(
 )
 plt.savefig("./coefficients.pdf")
 plt.close()
+
+# now plot displacement over time                                           
+g = sns.lineplot(x="ts", y="disp_y", marker="o", data=data_preproc)
+sns.despine()                                                               
+plt.xlabel(r"$t [s]$")                                                      
+plt.ylabel("")                                                              
+plt.legend(title="", bbox_to_anchor=(0.9, 0.9), loc=2, labels=[r"$disp_y$"])
+plt.savefig("disp_y.pdf")                                         
+plt.close()                                                                 
