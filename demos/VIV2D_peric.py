@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import time
 
 from VarMINT import *
 from VarMINTpostproc import integrate_force_strong
@@ -18,6 +19,62 @@ matplotlib.use("Agg")
 
 # Suppress excessive output in parallel:
 parameters["std_out_all_processes"] = False
+
+# results postprocess function
+def postprocess(results_dict):
+    data_preproc = pd.DataFrame.from_dict(results_dict)
+    data_preproc.to_csv("./raw_data.csv")
+    data_preproc["disp_x"] = data_preproc["disp_x"].div(D)
+    data_preproc["disp_y"] = data_preproc["disp_y"].div(D)
+
+    fade_ = 4  # DOWNSAMPLE FACTOR FOR THE PLOTS
+    data_preproc = data_preproc.iloc[
+        1::fade_, :
+    ]  # only get some of the rows in the plot
+    # For plots, might remove initial seconds where pressure wave gives spurious
+    # very high values
+    # data_preproc = data_preproc[data_preproc.ts > 2]
+    g = sns.lineplot(
+        x="ts",
+        y="value",
+        hue="variable",
+        hue_order=["CL", "CD"],
+        marker="o",
+        data=pd.melt(data_preproc, ["ts"]),
+    )
+    sns.despine()
+    plt.xlabel(r"$t [s]$")
+    plt.ylabel("")
+    plt.legend(
+        title="Coefficient",
+        bbox_to_anchor=(0.9, 0.9),
+        loc=2,
+        labels=[r"$C_L$", r"$C_D$"],
+    )
+    plt.savefig("coefficients.pdf")
+    plt.close()
+
+    # now plot displacement over time
+    g = sns.lineplot(
+        x="ts",
+        y="value",
+        hue="variable",
+        marker="o",
+        hue_order=["disp_x", "disp_y"],
+        data=pd.melt(data_preproc, ["ts"]),
+    )
+    sns.despine()
+    plt.xlabel(r"$t [s]$")
+    plt.ylabel("")
+    plt.legend(
+        title="Displacement",
+        bbox_to_anchor=(0.9, 0.9),
+        loc=2,
+        labels=[r"$disp_x/D$", r"$disp_y/D$"],
+    )
+    plt.savefig("disp_xy.pdf")
+    plt.close()
+
 
 ####### Parameters #######
 
@@ -48,7 +105,7 @@ Re = Constant(float(args.Re))
 k = int(args.k)
 T = float(args.T)
 rhoinf = float(args.rhoinf)
-D = 1.6e-3
+D = 1.0
 
 # store results
 results = defaultdict(list)
@@ -60,7 +117,7 @@ dx = dx(metadata={"quadrature_degree": QUAD_DEG})
 
 # Domain:
 mesh = Mesh(MPI.comm_world)
-with XDMFFile("bfile_VIV_peric.xdmf") as file:
+with XDMFFile("bfile_VIV_square.xdmf") as file:
     file.read(mesh)
 
 mtot_ = MPI.sum(MPI.comm_world, mesh.num_cells())
@@ -68,7 +125,7 @@ print(f"Read mesh with {mtot_} cells.")
 
 # Read boundary data
 mvc_boundaries = MeshValueCollection("size_t", mesh, mesh.topology().dim() - 1)
-with XDMFFile("domains_VIV_peric.xdmf") as file:
+with XDMFFile("domains_VIV_square.xdmf") as file:
     file.read(mvc_boundaries)
 boundaries = cpp.mesh.MeshFunctionSizet(mesh, mvc_boundaries)
 ds = Measure("ds", domain=mesh, subdomain_data=boundaries)
@@ -85,7 +142,7 @@ v, q = split(vq)
 
 # Determine physical parameters from Reynolds number:
 rho = Constant(1.0)
-mu = Constant(1.0 / 1.0e6)
+mu = Constant(1.0e-2)
 Uinf = Constant(mu * Re / D)
 nu = mu / rho
 
@@ -174,7 +231,7 @@ F = interiorResidual(
     mesh,
     u_t=u_t_alpha,
     Dt=Dt,
-    C_I=Constant(6.0 * (k ** 4)),
+    C_I=Constant(6.0 * (k**4)),
     dx=dx,
     u_mesh=v_mesh_alpha,
 )
@@ -195,9 +252,9 @@ alpha_fr = 1.0 / (1.0 + rhoinf_r)
 alpha_mr = (2.0 - rhoinf_r) / (1.0 + rhoinf_r)
 beta_r = 0.25 * (1 + alpha_mr - alpha_fr) ** 2
 gamma_r = 0.5 + alpha_mr - alpha_fr
-k = 5.79  # [N/m]
-c = 3.25e-4  # [Kg/s]
-m = 2.979e-3  # [Kg]
+k = 12.0 * np.pi**2 / 25.0  # [N/m]
+c = 0.0  # [Kg/s]
+m = 3.0  # [Kg]
 
 
 def Mm():
@@ -226,7 +283,7 @@ def solid_alpha(
     y_alpha = (
         y_old
         + Dt * alpha_fr * (gamma_r - beta_r) / gamma_r * ydot_old
-        + Dt ** 2 * alpha_fr * (gamma_r - 2 * beta_r) / 2.0 / gamma_r * yddot_old
+        + Dt**2 * alpha_fr * (gamma_r - 2 * beta_r) / 2.0 / gamma_r * yddot_old
         + Dt * alpha_fr * beta_r / gamma_r * ydot
     )
     ydot_alpha = (1 - alpha_fr) * ydot_old + alpha_fr * ydot
@@ -268,7 +325,7 @@ def solid_step_nonlinear(
     CM = Cm(y_alpha, ydot_alpha)
     eps = Fext - restoring_force(KM, CM, y_alpha, ydot_alpha) - MM @ yddot_alpha
 
-    alphatol = 1e-15
+    alphatol = 1e-10
     it = 0
 
     # Store ydot now, return a copy since the code might iterate if the
@@ -319,7 +376,7 @@ def solid_step_linear(
         * (
             2 * Dt * K @ (Dt * yddot_old + ydot_old) * beta_r
             - gamma_r
-            * (Dt ** 2 * K @ yddot_old - 2 * C @ ydot_old + 2 * Dt * K @ ydot_old)
+            * (Dt**2 * K @ yddot_old - 2 * C @ ydot_old + 2 * Dt * K @ ydot_old)
         )
     )
     mat = 2 * (alpha_mr * M + Dt * alpha_fr * (Dt * beta_r * K + gamma_r * C))
@@ -337,7 +394,7 @@ def solid_corrector(beta_r, gamma_r, Dt, ydot, y_old, ydot_old, yddot_old):
     y_new = (
         y_old
         + Dt * (gamma_r - beta_r) / gamma_r * ydot_old
-        + Dt ** 2 * (gamma_r - 2 * beta_r) / 2 / gamma_r * yddot_old
+        + Dt**2 * (gamma_r - 2 * beta_r) / 2 / gamma_r * yddot_old
         + Dt * beta_r / gamma_r * ydot
     )
     yddot_new = -(1 - gamma_r) / gamma_r * yddot_old + 1.0 / Dt / gamma_r * (
@@ -360,12 +417,15 @@ def fsi_postprocessing(
     Calculate the normalized residual for the fsi iteration, and relax the
     iteration result with the Aitken acceleration method
     """
-    print("YDOT ITER, YDOT ITER OLD", ydot_iter, ydot_iter_old)
+    if MPI.rank(MPI.comm_world) == 0:
+        print("YDOT ITER, YDOT ITER OLD", ydot_iter, ydot_iter_old)
     np.copyto(residual_old, residual)
     residual_new = ydot_iter - ydot_iter_old
-    print("RESIDUAL, RESIDUAL OLD", residual_new, residual_old)
+    if MPI.rank(MPI.comm_world) == 0:
+        print("RESIDUAL, RESIDUAL OLD", residual_new, residual_old)
     res_ = np.linalg.norm(residual_new) / (np.linalg.norm(ydot_old) + 1.0e-8)
-    print(f"RESIDUAL NORM IS {res_}")
+    if MPI.rank(MPI.comm_world) == 0:
+        print(f"RESIDUAL NORM IS {res_}")
     np.copyto(fsi_resd, res_)
     np.copyto(residual, residual_new)
     omega_new = (
@@ -374,10 +434,12 @@ def fsi_postprocessing(
         * np.dot(residual_old, (residual - residual_old))
         / (np.linalg.norm(residual - residual_old) ** 2 + 1.0e-24)
     )
-    print(f"OMEGA NEW VALUE RAW: {omega_new}")
-    omega_new = max(min(omega_new, 0.99), 0.9)
+    if MPI.rank(MPI.comm_world) == 0:
+        print(f"OMEGA NEW VALUE RAW: {omega_new}")
+    omega_new = max(min(omega_new, 0.99), 0.2)
     ydot_new_post = omega_new * ydot_iter + (1.0 - omega_new) * ydot_iter_old
-    print(f"ITER: {iter_fsi}. OMEGA VALUE: {omega_new}. SOLID VELOCITY IS: {ydot}")
+    if MPI.rank(MPI.comm_world) == 0:
+        print(f"ITER: {iter_fsi}. OMEGA VALUE: {omega_new}. SOLID VELOCITY IS: {ydot}")
     return ydot_new_post, np.array(omega_new)
 
 
@@ -409,7 +471,7 @@ F0 = interiorResidual(
     mesh,
     u_t=ut,
     Dt=Dt,
-    C_I=Constant(6.0 * (k ** 4)),
+    C_I=Constant(6.0 * (k**4)),
     dx=dx,
     u_mesh=v_mesh_alpha,
 )
@@ -425,7 +487,7 @@ F1 = interiorResidual(
     mesh,
     u_t=ut,
     Dt=Dt,
-    C_I=Constant(6.0 * (k ** 4)),
+    C_I=Constant(6.0 * (k**4)),
     dx=dx,
     u_mesh=v_mesh_alpha,
 )
@@ -434,6 +496,7 @@ F1 = interiorResidual(
 t = 0.0
 results["ts"].append(t)
 results["disp_y"].append(0.0)
+results["disp_x"].append(0.0)
 results["CD"].append(-2.0 * assemble(F0))
 results["CL"].append(-2.0 * assemble(F1))
 results["freq"].append(0.0)
@@ -441,27 +504,27 @@ max_iter_fsi = 50
 fsi_tol = 1e-4
 
 # Time stepping loop:
-with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
+start = time.time()
+with XDMFFile("solup.xdmf") as fileup:
 
-    fileu.parameters.update(
-        {"functions_share_mesh": True, "rewrite_function_mesh": True}
-    )
-
-    filep.parameters.update(
+    fileup.parameters.update(
         {"functions_share_mesh": True, "rewrite_function_mesh": True}
     )
 
     for step in range(0, N_STEPS):
         t += float(Dt)
-        print("======= Time step " + str(step + 1) + "/" + str(N_STEPS) + " =======")
+        if MPI.rank(MPI.comm_world) == 0:
+            print(
+                "======= Time step " + str(step + 1) + "/" + str(N_STEPS) + " ======="
+            )
         iter_fsi = 0
         fsi_resd = np.array([1e8])
-        omega_old = np.array([0.9])
+        omega_old = np.array([0.2])
 
         # Update dirichlet boundary condition:
         vbc.t = t
-            
-        # Mesh velocity and motion predictor 
+
+        # Mesh velocity and motion predictor
         bc_m_obstacle = DirichletBC(VM, v_mesh_exp, boundaries, ball)
         v_mesh_old.vector().zero()
         v_mesh_old.vector().axpy(1.0, v_mesh.vector())
@@ -469,8 +532,9 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         v_mesh_alpha.vector().zero()
         v_mesh_alpha.vector().axpy(1.0, v_mesh_old.vector())
         Sm0.vector().zero()
-        Sm0.vector().axpy(alpha_ff*Dt, v_mesh_old.vector())
-        print("CALLING ALE MOVE.")
+        Sm0.vector().axpy(alpha_ff * Dt, v_mesh_old.vector())
+        if MPI.rank(MPI.comm_world) == 0:
+            print("CALLING ALE MOVE.")
         ALE.move(mesh, Sm0)
 
         while iter_fsi < max_iter_fsi and fsi_resd[0] > fsi_tol:
@@ -478,13 +542,15 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             Fext = -1.0 * integrate_force_strong(u, p, mu, mesh, ds, 1)
             # Actually use the variational calculation
             fx0, fx1 = assemble(F0), assemble(F1)
-            print(f"{fx0=}, {fx1=}, {Fext=}")
+            if MPI.rank(MPI.comm_world) == 0:
+                print(f"{fx0=}, {fx1=}, {Fext=}")
             Fext[0] = 0.0
             # Wait for wake to develop
             if t < 2.5:
-                Fext[1] = 0.0
+                np.copyto(Fext, np.zeros(2))
             else:
-                Fext[1] = -1.0 * fx1
+                np.copyto(Fext, np.array([-1.0 * fx0, -1.0 * fx1]))
+
             ydot_new = solid_step_nonlinear(
                 alpha_fr,
                 alpha_mr,
@@ -517,6 +583,7 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             np.copyto(ydot_iter, ydot_new_post)
             np.copyto(ydot, ydot_new_post)
             # Update mesh velocity for next time-step
+            vte_x.Ux = ydot[0]
             vte_y.Uy = ydot[1]
             np.copyto(omega_old, omega_new)
 
@@ -539,20 +606,22 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
             bc_m_obstacle = DirichletBC(VM, v_mesh_exp, boundaries, ball)
             solve(a_m == f_m, v_mesh, bcs=bcs_m + [bc_m_obstacle])
             v_mesh_alpha.vector().zero()
-            v_mesh_alpha.vector().axpy(1.0-alpha_ff, v_mesh_old.vector())
+            v_mesh_alpha.vector().axpy(1.0 - alpha_ff, v_mesh_old.vector())
             v_mesh_alpha.vector().axpy(alpha_ff, v_mesh.vector())
             Sm.vector().zero()
-            Sm.vector().axpy(alpha_ff*Dt*gamma_f, v_mesh.vector())
-            Sm.vector().axpy(alpha_ff*Dt*(1.0-gamma_f), v_mesh_old.vector())
+            Sm.vector().axpy(alpha_ff * Dt * gamma_f, v_mesh.vector())
+            Sm.vector().axpy(alpha_ff * Dt * (1.0 - gamma_f), v_mesh_old.vector())
             Sm.vector().axpy(-1.0, Sm0.vector())
-            print("CALLING ALE MOVE.")
+            if MPI.rank(MPI.comm_world) == 0:
+                print("CALLING ALE MOVE.")
             ALE.move(mesh, Sm)
             Sm0.vector().zero()
             Sm0.vector().axpy(1.0, Sm.vector())
 
             iter_fsi += 1
 
-        print(f"Converged in {iter_fsi} FSI iterations.")
+        if MPI.rank(MPI.comm_world) == 0:
+            print(f"Converged in {iter_fsi} FSI iterations.")
         # Corrector step for fluid
         upt.assign(
             1.0 / float(Dt) / gamma_f * (up - up_old)
@@ -568,15 +637,8 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         np.copyto(ydot_old, ydot)
         np.copyto(yddot_old, yddot_new)
 
-        # Save some results
-        uf, pf = up.split(deepcopy=True)
-        uf.rename("Velocity", "Velocity")
-        pf.rename("Pressure", "Pressure")
-        if not step % 100:
-            fileu.write(uf, step)
-            filep.write(pf, step)
-
         results["ts"].append(t)
+        results["disp_x"].append(y_old[0])
         results["disp_y"].append(y_old[1])
         results["CD"].append(-2.0 * assemble(F0))
         results["CL"].append(-2.0 * assemble(F1))
@@ -590,46 +652,25 @@ with XDMFFile("solu.xdmf") as fileu, XDMFFile("solp.xdmf") as filep:
         idx = np.argmax(np.abs(ws))
         maxf = np.abs(freqs[idx])
         if MPI.rank(MPI.comm_world) == 0:
-            print(f"main frequency sampled from data is: {maxf:.2f}")
+            print(f"main frequency sampled from data is: {maxf:.4f}")
         results["freq"].append(maxf)
 
-print("End of time loop.")
+        if not step % 100:
+            postprocess(results)
+            # Save some results
+            uf, pf = up.split(deepcopy=True)
+            uf.rename("Velocity", "Velocity")
+            pf.rename("Pressure", "Pressure")
+            fileup.write(uf, step)
+            fileup.write(pf, step)
+
+end = time.time()
+if MPI.rank(MPI.comm_world) == 0:
+    print(
+        "End of time loop. "
+        f"Total computing time: {end - start}s, "
+        f"average time per step: {(end - start)/N_STEPS:.3f}s."
+    )
 
 # End run postprocessing
-data_preproc = pd.DataFrame.from_dict(results)
-data_preproc.to_csv("./raw_data.csv")
-data_preproc["disp_y"] = data_preproc["disp_y"].div(D)
-
-fade_ = 4  # DOWNSAMPLE FACTOR FOR THE PLOTS
-data_preproc = data_preproc.iloc[1::fade_, :]  # only get some of the rows in the plot
-# For plots, might remove initial seconds where pressure wave gives spurious
-# very high values
-data_preproc = data_preproc[data_preproc.ts > 2]
-g = sns.lineplot(
-    x="ts",
-    y="value",
-    hue="variable",
-    hue_order=["CL", "CD"],
-    marker="o",
-    data=pd.melt(data_preproc, ["ts"]),
-)
-sns.despine()
-plt.xlabel(r"$t [s]$")
-plt.ylabel(r"$y/D$")
-plt.legend(
-    title="Coefficient",
-    bbox_to_anchor=(0.9, 0.9),
-    loc=2,
-    labels=[r"$C_L$", r"$C_D$"],
-)
-plt.savefig("./coefficients.pdf")
-plt.close()
-
-# now plot displacement over time                                           
-g = sns.lineplot(x="ts", y="disp_y", marker="o", data=data_preproc)
-sns.despine()                                                               
-plt.xlabel(r"$t [s]$")                                                      
-plt.ylabel("")                                                              
-plt.legend(title="", bbox_to_anchor=(0.9, 0.9), loc=2, labels=[r"$disp_y$"])
-plt.savefig("disp_y.pdf")                                         
-plt.close()                                                                 
+postprocess(results)
